@@ -1,16 +1,5 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package otelcol // import "go.opentelemetry.io/collector/otelcol"
 
@@ -19,7 +8,6 @@ import (
 	"fmt"
 
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/otelcol/internal/sharedgate"
 	"go.opentelemetry.io/collector/service"
 )
 
@@ -108,10 +96,6 @@ func (cfg *Config) Validate() error {
 		}
 	}
 
-	if len(cfg.Connectors) != 0 && !sharedgate.ConnectorsFeatureGate.IsEnabled() {
-		return fmt.Errorf("connectors require feature gate: %s", sharedgate.ConnectorsFeatureGate.ID())
-	}
-
 	if err := cfg.Service.Validate(); err != nil {
 		return err
 	}
@@ -141,14 +125,14 @@ func (cfg *Config) Validate() error {
 				connectorsAsReceivers[ref] = struct{}{}
 				continue
 			}
-			return fmt.Errorf("service::pipeline::%s: references receiver %q which is not configured", pipelineID, ref)
+			return fmt.Errorf("service::pipelines::%s: references receiver %q which is not configured", pipelineID, ref)
 		}
 
 		// Validate pipeline processor name references.
 		for _, ref := range pipeline.Processors {
 			// Check that the name referenced in the pipeline's processors exists in the top-level processors.
 			if cfg.Processors[ref] == nil {
-				return fmt.Errorf("service::pipeline::%s: references processor %q which is not configured", pipelineID, ref)
+				return fmt.Errorf("service::pipelines::%s: references processor %q which is not configured", pipelineID, ref)
 			}
 		}
 
@@ -162,7 +146,7 @@ func (cfg *Config) Validate() error {
 				connectorsAsExporters[ref] = struct{}{}
 				continue
 			}
-			return fmt.Errorf("service::pipeline::%s: references exporter %q which is not configured", pipelineID, ref)
+			return fmt.Errorf("service::pipelines::%s: references exporter %q which is not configured", pipelineID, ref)
 		}
 	}
 
