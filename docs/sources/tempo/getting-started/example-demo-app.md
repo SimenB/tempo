@@ -1,5 +1,6 @@
 ---
 title: Example setups
+description: This page provides setup examples of how Tempo can be configured for a sample environment.
 aliases:
 - /docs/tempo/latest/getting-started/quickstart-tempo/
 - /docs/tempo/latest/guides/loki-derived-fields/
@@ -12,10 +13,10 @@ The following examples show various deployment and configuration options using t
 
 For more information about Tempo setup and configuration, see:
 
-* [Set up Tempo]({{< relref "../setup">}})
+* [Set up Tempo]({{< relref "../setup" >}})
 * [Tempo configuration]({{< relref "../configuration" >}})
 
-If you are interested in instrumentation, see [Tempo instrumentation]({{< relref "instrumentation" >}}).
+If you are interested in instrumentation, see [Tempo instrumentation]({{< relref "./instrumentation" >}}).
 
 ## Docker Compose
 
@@ -24,10 +25,9 @@ The [docker-compose examples](https://github.com/grafana/tempo/tree/main/example
 Some of the examples include:
 
 - Trace discovery with Loki
-- Basic Grafana Agent/OpenTelemetry Setup
+- Basic Grafana Alloy/OpenTelemetry Setup
 - Various Backends (S3/GCS/Azure)
-- [K6 with Traces]({{< relref "docker-example" >}})
-
+- [K6 with Traces]({{< relref "./docker-example" >}})
 This is a great place to get started with Tempo and learn about various trace discovery flows.
 
 ## Helm
@@ -46,6 +46,6 @@ To learn how to set up a Tempo cluster, see [Deploy on Kubernetes with Tanka]({{
 
 ## Introduction to Metrics, Logs and Traces example
 
-The [Introduction to Metrics, Logs and Traces in Grafana](https://github.com/grafana/intro-to-mlt) provides a self-contained environment for learning about Mimir, Loki, Tempo, and Grafana. It includes detailed explanations of each compononent, annotated configurations for each component.
+The [Introduction to Metrics, Logs and Traces in Grafana](https://github.com/grafana/intro-to-mlt) provides a self-contained environment for learning about Mimir, Loki, Tempo, and Grafana. It includes detailed explanations of each component, annotated configurations for each component.
 
-The README.md file has full details on how to quickly download and [start the environment](https://github.com/grafana/intro-to-mlt#running-the-demonstration-environment). Additionally, you can use the [`ctl.sh`](https://github.com/grafana/intro-to-mlt#grafana-cloud) script to alter the environment to send metrics, logs, and traces to Grafana Cloud.
+The README.md file has full details on how to quickly download and [start the environment](https://github.com/grafana/intro-to-mlt#running-the-demonstration-environment), including instructions for using Grafana Cloud and the OpenTelemetry Alloy.

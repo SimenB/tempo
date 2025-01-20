@@ -8,13 +8,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/grafana/dskit/user"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/stretchr/testify/require"
+	"github.com/uber-go/atomic"
+
 	generator_client "github.com/grafana/tempo/modules/generator/client"
 	ingester_client "github.com/grafana/tempo/modules/ingester/client"
 	"github.com/grafana/tempo/modules/overrides"
+	"github.com/grafana/tempo/modules/querier/external"
 	"github.com/grafana/tempo/pkg/tempopb"
-	"github.com/stretchr/testify/require"
-	"github.com/uber-go/atomic"
-	"github.com/weaveworks/common/user"
 )
 
 func TestQuerierUsesSearchExternalEndpoint(t *testing.T) {
@@ -47,6 +50,19 @@ func TestQuerierUsesSearchExternalEndpoint(t *testing.T) {
 			queriesToExecute: 3,
 			externalExpected: 0,
 		},
+		{
+			cfg: Config{
+				Search: SearchConfig{
+					ExternalBackend: "google_cloud_run",
+					CloudRun: &external.CloudRunConfig{
+						Endpoints: []string{srv.URL},
+						NoAuth:    true,
+					},
+				},
+			},
+			queriesToExecute: 1,
+			externalExpected: 1,
+		},
 		// SearchPreferSelf is respected. this test won't pass b/c SearchBlock fails instantly and so
 		//  all 3 queries are executed locally and nothing is proxied to the external endpoint.
 		//  we'd have to mock the storage.Store interface to get this to pass. it's a big interface.
@@ -65,7 +81,7 @@ func TestQuerierUsesSearchExternalEndpoint(t *testing.T) {
 	for _, tc := range tests {
 		numExternalRequests.Store(0)
 
-		o, err := overrides.NewOverrides(overrides.Limits{})
+		o, err := overrides.NewOverrides(overrides.Config{}, nil, prometheus.DefaultRegisterer)
 		require.NoError(t, err)
 
 		q, err := New(tc.cfg, ingester_client.Config{}, nil, generator_client.Config{}, nil, nil, o)
@@ -82,7 +98,7 @@ func TestQuerierUsesSearchExternalEndpoint(t *testing.T) {
 }
 
 func TestVirtualTagsDoesntHitBackend(t *testing.T) {
-	o, err := overrides.NewOverrides(overrides.Limits{})
+	o, err := overrides.NewOverrides(overrides.Config{}, nil, prometheus.DefaultRegisterer)
 	require.NoError(t, err)
 
 	q, err := New(Config{}, ingester_client.Config{}, nil, generator_client.Config{}, nil, nil, o)
@@ -95,14 +111,14 @@ func TestVirtualTagsDoesntHitBackend(t *testing.T) {
 		TagName: "duration",
 	})
 	require.NoError(t, err)
-	require.Equal(t, &tempopb.SearchTagValuesV2Response{}, resp)
+	require.Equal(t, &tempopb.SearchTagValuesV2Response{Metrics: &tempopb.MetadataMetrics{}}, resp)
 
 	// traceDuration should return nothing
 	resp, err = q.SearchTagValuesV2(ctx, &tempopb.SearchTagValuesRequest{
 		TagName: "traceDuration",
 	})
 	require.NoError(t, err)
-	require.Equal(t, &tempopb.SearchTagValuesV2Response{}, resp)
+	require.Equal(t, &tempopb.SearchTagValuesV2Response{Metrics: &tempopb.MetadataMetrics{}}, resp)
 
 	// status should return a static list
 	resp, err = q.SearchTagValuesV2(ctx, &tempopb.SearchTagValuesRequest{
@@ -125,6 +141,7 @@ func TestVirtualTagsDoesntHitBackend(t *testing.T) {
 				Value: "unset",
 			},
 		},
+		Metrics: &tempopb.MetadataMetrics{},
 	}, resp)
 
 	// kind should return a static list
@@ -160,13 +177,13 @@ func TestVirtualTagsDoesntHitBackend(t *testing.T) {
 				Value: "unspecified",
 			},
 		},
+		Metrics: &tempopb.MetadataMetrics{},
 	}, resp)
 
-	// this should panic b/c we haven't actually set any of the fields on the querier necessary for it to forward requests
-	// to the ingesters.
-	require.Panics(t, func() {
-		_, _ = q.SearchTagValuesV2(ctx, &tempopb.SearchTagValuesRequest{
-			TagName: ".foo",
-		})
+	// this should error b/c it will attempt to hit the un-configured backend
+	resp, err = q.SearchTagValuesV2(ctx, &tempopb.SearchTagValuesRequest{
+		TagName: ".foo",
 	})
+	require.Error(t, err)
+	require.Nil(t, resp)
 }

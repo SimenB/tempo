@@ -1,16 +1,5 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package proctelemetry // import "go.opentelemetry.io/collector/service/internal/proctelemetry"
 
@@ -21,39 +10,18 @@ import (
 	"sync"
 	"time"
 
-	"github.com/shirou/gopsutil/v3/process"
-	"go.opencensus.io/metric"
-	"go.opencensus.io/stats"
-	otelmetric "go.opentelemetry.io/otel/metric"
-	"go.opentelemetry.io/otel/metric/instrument"
-	"go.uber.org/multierr"
-)
+	"github.com/shirou/gopsutil/v4/common"
+	"github.com/shirou/gopsutil/v4/process"
 
-const (
-	scopeName      = "go.opentelemetry.io/collector/service/process_telemetry"
-	processNameKey = "process_name"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/service/internal/metadata"
 )
 
 // processMetrics is a struct that contains views related to process metrics (cpu, mem, etc)
 type processMetrics struct {
 	startTimeUnixNano int64
-	ballastSizeBytes  uint64
 	proc              *process.Process
-
-	processUptime *metric.Float64DerivedCumulative
-	allocMem      *metric.Int64DerivedGauge
-	totalAllocMem *metric.Int64DerivedCumulative
-	sysMem        *metric.Int64DerivedGauge
-	cpuSeconds    *metric.Float64DerivedCumulative
-	rssMemory     *metric.Int64DerivedGauge
-
-	// otel metrics
-	otelProcessUptime instrument.Float64ObservableCounter
-	otelAllocMem      instrument.Int64ObservableGauge
-	otelTotalAllocMem instrument.Int64ObservableCounter
-	otelSysMem        instrument.Int64ObservableGauge
-	otelCPUSeconds    instrument.Float64ObservableCounter
-	otelRSSMemory     instrument.Int64ObservableGauge
+	context           context.Context
 
 	// mu protects everything bellow.
 	mu         sync.Mutex
@@ -61,163 +29,60 @@ type processMetrics struct {
 	ms         *runtime.MemStats
 }
 
+type RegisterOption interface {
+	apply(*registerOption)
+}
+
+type registerOption struct {
+	hostProc string
+}
+
+type registerOptionFunc func(*registerOption)
+
+func (fn registerOptionFunc) apply(set *registerOption) {
+	fn(set)
+}
+
+// WithHostProc overrides the /proc folder on Linux used by process telemetry.
+func WithHostProc(hostProc string) RegisterOption {
+	return registerOptionFunc(func(uo *registerOption) {
+		uo.hostProc = hostProc
+	})
+}
+
 // RegisterProcessMetrics creates a new set of processMetrics (mem, cpu) that can be used to measure
 // basic information about this process.
-func RegisterProcessMetrics(ocRegistry *metric.Registry, mp otelmetric.MeterProvider, useOtel bool, ballastSizeBytes uint64) error {
+func RegisterProcessMetrics(cfg component.TelemetrySettings, opts ...RegisterOption) error {
+	set := registerOption{}
+	for _, opt := range opts {
+		opt.apply(&set)
+	}
 	var err error
 	pm := &processMetrics{
 		startTimeUnixNano: time.Now().UnixNano(),
-		ballastSizeBytes:  ballastSizeBytes,
 		ms:                &runtime.MemStats{},
 	}
 
-	pm.proc, err = process.NewProcess(int32(os.Getpid()))
+	ctx := context.Background()
+	if set.hostProc != "" {
+		ctx = context.WithValue(ctx, common.EnvKey, common.EnvMap{common.HostProcEnvKey: set.hostProc})
+	}
+	pm.context = ctx
+	// nolint:gosec
+	pm.proc, err = process.NewProcessWithContext(pm.context, int32(os.Getpid()))
 	if err != nil {
 		return err
 	}
 
-	if useOtel {
-		return pm.recordWithOtel(mp.Meter(scopeName))
-	}
-	return pm.recordWithOC(ocRegistry)
-}
-
-func (pm *processMetrics) recordWithOC(ocRegistry *metric.Registry) error {
-	var err error
-
-	pm.processUptime, err = ocRegistry.AddFloat64DerivedCumulative(
-		"process/uptime",
-		metric.WithDescription("Uptime of the process"),
-		metric.WithUnit(stats.UnitSeconds))
-	if err != nil {
-		return err
-	}
-	if err = pm.processUptime.UpsertEntry(pm.updateProcessUptime); err != nil {
-		return err
-	}
-
-	pm.allocMem, err = ocRegistry.AddInt64DerivedGauge(
-		"process/runtime/heap_alloc_bytes",
-		metric.WithDescription("Bytes of allocated heap objects (see 'go doc runtime.MemStats.HeapAlloc')"),
-		metric.WithUnit(stats.UnitBytes))
-	if err != nil {
-		return err
-	}
-	if err = pm.allocMem.UpsertEntry(pm.updateAllocMem); err != nil {
-		return err
-	}
-
-	pm.totalAllocMem, err = ocRegistry.AddInt64DerivedCumulative(
-		"process/runtime/total_alloc_bytes",
-		metric.WithDescription("Cumulative bytes allocated for heap objects (see 'go doc runtime.MemStats.TotalAlloc')"),
-		metric.WithUnit(stats.UnitBytes))
-	if err != nil {
-		return err
-	}
-	if err = pm.totalAllocMem.UpsertEntry(pm.updateTotalAllocMem); err != nil {
-		return err
-	}
-
-	pm.sysMem, err = ocRegistry.AddInt64DerivedGauge(
-		"process/runtime/total_sys_memory_bytes",
-		metric.WithDescription("Total bytes of memory obtained from the OS (see 'go doc runtime.MemStats.Sys')"),
-		metric.WithUnit(stats.UnitBytes))
-	if err != nil {
-		return err
-	}
-	if err = pm.sysMem.UpsertEntry(pm.updateSysMem); err != nil {
-		return err
-	}
-
-	pm.cpuSeconds, err = ocRegistry.AddFloat64DerivedCumulative(
-		"process/cpu_seconds",
-		metric.WithDescription("Total CPU user and system time in seconds"),
-		metric.WithUnit(stats.UnitSeconds))
-	if err != nil {
-		return err
-	}
-	if err = pm.cpuSeconds.UpsertEntry(pm.updateCPUSeconds); err != nil {
-		return err
-	}
-
-	pm.rssMemory, err = ocRegistry.AddInt64DerivedGauge(
-		"process/memory/rss",
-		metric.WithDescription("Total physical memory (resident set size)"),
-		metric.WithUnit(stats.UnitBytes))
-	if err != nil {
-		return err
-	}
-	if err = pm.rssMemory.UpsertEntry(pm.updateRSSMemory); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (pm *processMetrics) recordWithOtel(meter otelmetric.Meter) error {
-	var errs, err error
-
-	pm.otelProcessUptime, err = meter.Float64ObservableCounter(
-		"process_uptime",
-		instrument.WithDescription("Uptime of the process"),
-		instrument.WithUnit("s"),
-		instrument.WithFloat64Callback(func(_ context.Context, o instrument.Float64Observer) error {
-			o.Observe(pm.updateProcessUptime())
-			return nil
-		}))
-	errs = multierr.Append(errs, err)
-
-	pm.otelAllocMem, err = meter.Int64ObservableGauge(
-		"process_runtime_heap_alloc_bytes",
-		instrument.WithDescription("Bytes of allocated heap objects (see 'go doc runtime.MemStats.HeapAlloc')"),
-		instrument.WithUnit("By"),
-		instrument.WithInt64Callback(func(_ context.Context, o instrument.Int64Observer) error {
-			o.Observe(pm.updateAllocMem())
-			return nil
-		}))
-	errs = multierr.Append(errs, err)
-
-	pm.otelTotalAllocMem, err = meter.Int64ObservableCounter(
-		"process_runtime_total_alloc_bytes",
-		instrument.WithDescription("Cumulative bytes allocated for heap objects (see 'go doc runtime.MemStats.TotalAlloc')"),
-		instrument.WithUnit("By"),
-		instrument.WithInt64Callback(func(_ context.Context, o instrument.Int64Observer) error {
-			o.Observe(pm.updateTotalAllocMem())
-			return nil
-		}))
-	errs = multierr.Append(errs, err)
-
-	pm.otelSysMem, err = meter.Int64ObservableGauge(
-		"process_runtime_total_sys_memory_bytes",
-		instrument.WithDescription("Total bytes of memory obtained from the OS (see 'go doc runtime.MemStats.Sys')"),
-		instrument.WithUnit("By"),
-		instrument.WithInt64Callback(func(_ context.Context, o instrument.Int64Observer) error {
-			o.Observe(pm.updateSysMem())
-			return nil
-		}))
-	errs = multierr.Append(errs, err)
-
-	pm.otelCPUSeconds, err = meter.Float64ObservableCounter(
-		"process_cpu_seconds",
-		instrument.WithDescription("Total CPU user and system time in seconds"),
-		instrument.WithUnit("s"),
-		instrument.WithFloat64Callback(func(_ context.Context, o instrument.Float64Observer) error {
-			o.Observe(pm.updateCPUSeconds())
-			return nil
-		}))
-	errs = multierr.Append(errs, err)
-
-	pm.otelRSSMemory, err = meter.Int64ObservableGauge(
-		"process_memory_rss",
-		instrument.WithDescription("Total physical memory (resident set size)"),
-		instrument.WithUnit("By"),
-		instrument.WithInt64Callback(func(_ context.Context, o instrument.Int64Observer) error {
-			o.Observe(pm.updateRSSMemory())
-			return nil
-		}))
-	errs = multierr.Append(errs, err)
-
-	return errs
+	_, err = metadata.NewTelemetryBuilder(cfg,
+		metadata.WithProcessUptimeCallback(pm.updateProcessUptime),
+		metadata.WithProcessRuntimeHeapAllocBytesCallback(pm.updateAllocMem),
+		metadata.WithProcessRuntimeTotalAllocBytesCallback(pm.updateTotalAllocMem),
+		metadata.WithProcessRuntimeTotalSysMemoryBytesCallback(pm.updateSysMem),
+		metadata.WithProcessCPUSecondsCallback(pm.updateCPUSeconds),
+		metadata.WithProcessMemoryRssCallback(pm.updateRSSMemory),
+	)
+	return err
 }
 
 func (pm *processMetrics) updateProcessUptime() float64 {
@@ -229,6 +94,7 @@ func (pm *processMetrics) updateAllocMem() int64 {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	pm.readMemStatsIfNeeded()
+	// nolint:gosec
 	return int64(pm.ms.Alloc)
 }
 
@@ -236,6 +102,7 @@ func (pm *processMetrics) updateTotalAllocMem() int64 {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	pm.readMemStatsIfNeeded()
+	// nolint:gosec
 	return int64(pm.ms.TotalAlloc)
 }
 
@@ -243,11 +110,12 @@ func (pm *processMetrics) updateSysMem() int64 {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	pm.readMemStatsIfNeeded()
+	// nolint:gosec
 	return int64(pm.ms.Sys)
 }
 
 func (pm *processMetrics) updateCPUSeconds() float64 {
-	times, err := pm.proc.Times()
+	times, err := pm.proc.TimesWithContext(pm.context)
 	if err != nil {
 		return 0
 	}
@@ -257,10 +125,11 @@ func (pm *processMetrics) updateCPUSeconds() float64 {
 }
 
 func (pm *processMetrics) updateRSSMemory() int64 {
-	mem, err := pm.proc.MemoryInfo()
+	mem, err := pm.proc.MemoryInfoWithContext(pm.context)
 	if err != nil {
 		return 0
 	}
+	// nolint:gosec
 	return int64(mem.RSS)
 }
 
@@ -272,10 +141,4 @@ func (pm *processMetrics) readMemStatsIfNeeded() {
 	}
 	pm.lastMsRead = now
 	runtime.ReadMemStats(pm.ms)
-	if pm.ballastSizeBytes > 0 {
-		pm.ms.Alloc -= pm.ballastSizeBytes
-		pm.ms.HeapAlloc -= pm.ballastSizeBytes
-		pm.ms.HeapSys -= pm.ballastSizeBytes
-		pm.ms.HeapInuse -= pm.ballastSizeBytes
-	}
 }

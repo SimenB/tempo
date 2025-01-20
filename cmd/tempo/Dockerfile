@@ -1,5 +1,14 @@
-FROM alpine:3.16 as certs
+FROM alpine:3.21 AS certs
 RUN apk --update add ca-certificates
 ARG TARGETARCH
 COPY bin/linux/tempo-${TARGETARCH} /tempo
+
+RUN addgroup -g 10001 -S tempo && \
+    adduser -u 10001 -S tempo -G tempo
+
+RUN mkdir -p /var/tempo -m 0700 && \
+    chown -R tempo:tempo /var/tempo
+
+USER 10001:10001
+
 ENTRYPOINT ["/tempo"]

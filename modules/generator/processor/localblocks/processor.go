@@ -3,15 +3,25 @@ package localblocks
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
 	"time"
 
+	kitlog "github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/golang/groupcache/lru"
 	"github.com/google/uuid"
+	"github.com/grafana/tempo/modules/ingester"
+	"github.com/grafana/tempo/pkg/flushqueues"
+	"github.com/grafana/tempo/pkg/tracesizes"
+	"github.com/grafana/tempo/tempodb"
+	"go.opentelemetry.io/otel"
+
 	gen "github.com/grafana/tempo/modules/generator/processor"
+	"github.com/grafana/tempo/pkg/livetraces"
 	"github.com/grafana/tempo/pkg/model"
 	"github.com/grafana/tempo/pkg/tempopb"
 	v1 "github.com/grafana/tempo/pkg/tempopb/trace/v1"
@@ -22,80 +32,150 @@ import (
 	"github.com/grafana/tempo/tempodb/encoding"
 	"github.com/grafana/tempo/tempodb/encoding/common"
 	"github.com/grafana/tempo/tempodb/wal"
-	"github.com/pkg/errors"
 )
 
+var tracer = otel.Tracer("modules/generator/processor/localblocks")
+
+const (
+	timeBuffer       = 5 * time.Minute
+	maxFlushAttempts = 100
+)
+
+// ProcessorOverrides is just the set of overrides needed here.
+type ProcessorOverrides interface {
+	DedicatedColumns(string) backend.DedicatedColumns
+	MaxBytesPerTrace(string) int
+	UnsafeQueryHints(string) bool
+}
+
 type Processor struct {
-	tenant   string
-	Cfg      Config
-	wal      *wal.WAL
-	closeCh  chan struct{}
-	wg       sync.WaitGroup
-	cacheMtx sync.RWMutex
-	cache    *lru.Cache
+	tenant    string
+	logger    kitlog.Logger
+	Cfg       Config
+	wal       *wal.WAL
+	walR      backend.Reader
+	walW      backend.Writer
+	closeCh   chan struct{}
+	wg        sync.WaitGroup
+	cacheMtx  sync.RWMutex
+	cache     *lru.Cache
+	overrides ProcessorOverrides
+	enc       encoding.VersionedEncoding
 
 	blocksMtx      sync.RWMutex
 	headBlock      common.WALBlock
 	walBlocks      map[uuid.UUID]common.WALBlock
-	completeBlocks map[uuid.UUID]common.BackendBlock
+	completeBlocks map[uuid.UUID]*ingester.LocalBlock
 	lastCutTime    time.Time
 
+	flushqueue *flushqueues.PriorityQueue
+
 	liveTracesMtx sync.Mutex
-	liveTraces    *liveTraces
+	liveTraces    *livetraces.LiveTraces
+	traceSizes    *tracesizes.Tracker
+
+	writer tempodb.Writer
 }
 
 var _ gen.Processor = (*Processor)(nil)
 
-func New(cfg Config, tenant string, wal *wal.WAL) (*Processor, error) {
-
+func New(cfg Config, tenant string, wal *wal.WAL, writer tempodb.Writer, overrides ProcessorOverrides) (p *Processor, err error) {
 	if wal == nil {
 		return nil, errors.New("local blocks processor requires traces wal")
 	}
 
-	p := &Processor{
-		Cfg:            cfg,
+	enc := encoding.DefaultEncoding()
+	if cfg.Block.Version != "" {
+		enc, err = encoding.FromVersion(cfg.Block.Version)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	p = &Processor{
 		tenant:         tenant,
+		logger:         log.WithUserID(tenant, log.Logger),
+		Cfg:            cfg,
 		wal:            wal,
+		walR:           backend.NewReader(wal.LocalBackend()),
+		walW:           backend.NewWriter(wal.LocalBackend()),
+		overrides:      overrides,
+		enc:            enc,
 		walBlocks:      map[uuid.UUID]common.WALBlock{},
-		completeBlocks: map[uuid.UUID]common.BackendBlock{},
-		liveTraces:     newLiveTraces(),
+		completeBlocks: map[uuid.UUID]*ingester.LocalBlock{},
+		flushqueue:     flushqueues.NewPriorityQueue(metricFlushQueueSize.WithLabelValues(tenant)),
+		liveTraces:     livetraces.New(),
+		traceSizes:     tracesizes.New(),
 		closeCh:        make(chan struct{}),
 		wg:             sync.WaitGroup{},
 		cache:          lru.New(100),
+		writer:         writer,
 	}
 
-	err := p.reloadBlocks()
+	err = p.reloadBlocks()
 	if err != nil {
-		return nil, errors.Wrap(err, "replaying blocks")
+		return nil, fmt.Errorf("replaying blocks: %w", err)
 	}
 
 	p.wg.Add(4)
-	go p.flushLoop()
-	go p.deleteLoop()
+	go p.cutLoop()
 	go p.completeLoop()
+	go p.deleteLoop()
 	go p.metricLoop()
+
+	if p.writer != nil && p.Cfg.FlushToStorage {
+		p.wg.Add(1)
+		go p.flushLoop()
+	}
 
 	return p, nil
 }
 
 func (*Processor) Name() string {
-	return "LocalBlocksProcessor"
+	return Name
 }
 
-func (p *Processor) PushSpans(ctx context.Context, req *tempopb.PushSpansRequest) {
-
+func (p *Processor) PushSpans(_ context.Context, req *tempopb.PushSpansRequest) {
 	p.liveTracesMtx.Lock()
 	defer p.liveTracesMtx.Unlock()
 
 	before := p.liveTraces.Len()
 
-	for _, batch := range req.Batches {
-		if batch = filterBatch(batch); batch != nil {
-			switch err := p.liveTraces.Push(batch, p.Cfg.MaxLiveTraces); err {
-			case errMaxExceeded:
-				metricDroppedTraces.WithLabelValues(p.tenant, reasonLiveTracesExceeded).Inc()
-			}
+	maxSz := p.overrides.MaxBytesPerTrace(p.tenant)
+
+	batches := req.Batches
+	if p.Cfg.FilterServerSpans {
+		batches = filterBatches(batches)
+	}
+
+	for _, batch := range batches {
+
+		// Spans in the batch are for the same trace.
+		// We use the first one.
+		if len(batch.ScopeSpans) == 0 || len(batch.ScopeSpans[0].Spans) == 0 {
+			return
 		}
+		traceID := batch.ScopeSpans[0].Spans[0].TraceId
+
+		// Metric total spans regardless of outcome
+		numSpans := 0
+		for _, ss := range batch.ScopeSpans {
+			numSpans += len(ss.Spans)
+		}
+		metricTotalSpans.WithLabelValues(p.tenant).Add(float64(numSpans))
+
+		// Check max trace size
+		if maxSz > 0 && !p.traceSizes.Allow(traceID, batch.Size(), maxSz) {
+			metricDroppedSpans.WithLabelValues(p.tenant, reasonTraceSizeExceeded).Add(float64(numSpans))
+			continue
+		}
+
+		// Live traces
+		if !p.liveTraces.Push(traceID, batch, p.Cfg.MaxLiveTraces) {
+			metricDroppedTraces.WithLabelValues(p.tenant, reasonLiveTracesExceeded).Inc()
+			continue
+		}
+
 	}
 
 	after := p.liveTraces.Len()
@@ -104,23 +184,23 @@ func (p *Processor) PushSpans(ctx context.Context, req *tempopb.PushSpansRequest
 	metricTotalTraces.WithLabelValues(p.tenant).Add(float64(after - before))
 }
 
-func (p *Processor) Shutdown(ctx context.Context) {
+func (p *Processor) Shutdown(context.Context) {
 	close(p.closeCh)
 	p.wg.Wait()
 
 	// Immediately cut all traces from memory
 	err := p.cutIdleTraces(true)
 	if err != nil {
-		level.Error(log.WithUserID(p.tenant, log.Logger)).Log("msg", "local blocks processor failed to cut remaining traces on shutdown", "err", err)
+		level.Error(p.logger).Log("msg", "local blocks processor failed to cut remaining traces on shutdown", "err", err)
 	}
 
 	err = p.cutBlocks(true)
 	if err != nil {
-		level.Error(log.WithUserID(p.tenant, log.Logger)).Log("msg", "local blocks processor failed to cut head block on shutdown", "err", err)
+		level.Error(p.logger).Log("msg", "local blocks processor failed to cut head block on shutdown", "err", err)
 	}
 }
 
-func (p *Processor) flushLoop() {
+func (p *Processor) cutLoop() {
 	defer p.wg.Done()
 
 	flushTicker := time.NewTicker(p.Cfg.FlushCheckPeriod)
@@ -131,12 +211,12 @@ func (p *Processor) flushLoop() {
 		case <-flushTicker.C:
 			err := p.cutIdleTraces(false)
 			if err != nil {
-				level.Error(log.WithUserID(p.tenant, log.Logger)).Log("msg", "local blocks processor failed to cut idle traces", "err", err)
+				level.Error(p.logger).Log("msg", "local blocks processor failed to cut idle traces", "err", err)
 			}
 
 			err = p.cutBlocks(false)
 			if err != nil {
-				level.Error(log.WithUserID(p.tenant, log.Logger)).Log("msg", "local blocks processor failed to cut head block", "err", err)
+				level.Error(p.logger).Log("msg", "local blocks processor failed to cut head block", "err", err)
 			}
 
 		case <-p.closeCh:
@@ -156,7 +236,7 @@ func (p *Processor) deleteLoop() {
 		case <-ticker.C:
 			err := p.deleteOldBlocks()
 			if err != nil {
-				level.Error(log.WithUserID(p.tenant, log.Logger)).Log("msg", "local blocks processor failed to delete old blocks", "err", err)
+				level.Error(p.logger).Log("msg", "local blocks processor failed to delete old blocks", "err", err)
 			}
 
 		case <-p.closeCh:
@@ -176,11 +256,61 @@ func (p *Processor) completeLoop() {
 		case <-ticker.C:
 			err := p.completeBlock()
 			if err != nil {
-				level.Error(log.WithUserID(p.tenant, log.Logger)).Log("msg", "local blocks processor failed to complete a block", "err", err)
+				level.Error(p.logger).Log("msg", "local blocks processor failed to complete a block", "err", err)
 			}
 
 		case <-p.closeCh:
 			return
+		}
+	}
+}
+
+func (p *Processor) flushLoop() {
+	defer p.wg.Done()
+
+	go func() {
+		<-p.closeCh
+		p.flushqueue.Close()
+	}()
+
+	for {
+		o := p.flushqueue.Dequeue()
+		if o == nil {
+			return
+		}
+
+		op := o.(*flushOp)
+		op.attempts++
+
+		if op.attempts > maxFlushAttempts {
+			_ = level.Error(p.logger).Log("msg", "failed to flush block after max attempts", "tenant", p.tenant, "block", op.blockID, "attempts", op.attempts)
+
+			// attempt to delete the block
+			p.blocksMtx.Lock()
+			err := p.wal.LocalBackend().ClearBlock(op.blockID, p.tenant)
+			if err != nil {
+				_ = level.Error(p.logger).Log("msg", "failed to clear corrupt block", "tenant", p.tenant, "block", op.blockID, "err", err)
+			}
+			delete(p.completeBlocks, op.blockID)
+			p.blocksMtx.Unlock()
+
+			continue
+		}
+
+		err := p.flushBlock(op.blockID)
+		if err != nil {
+			_ = level.Info(p.logger).Log("msg", "re-queueing block for flushing", "block", op.blockID, "attempts", op.attempts, "err", err)
+			metricFailedFlushes.Inc()
+
+			delay := op.backoff()
+			op.at = time.Now().Add(delay)
+
+			go func() {
+				time.Sleep(delay)
+				if _, err := p.flushqueue.Enqueue(op); err != nil {
+					_ = level.Error(p.logger).Log("msg", "failed to requeue block for flushing", "err", err)
+				}
+			}()
 		}
 	}
 }
@@ -204,7 +334,6 @@ func (p *Processor) metricLoop() {
 }
 
 func (p *Processor) completeBlock() error {
-
 	// Get a wal block
 	var firstWalBlock common.WALBlock
 	p.blocksMtx.RLock()
@@ -219,15 +348,16 @@ func (p *Processor) completeBlock() error {
 	}
 
 	// Now create a new block
-
 	var (
 		ctx    = context.Background()
-		enc    = encoding.DefaultEncoding()
 		reader = backend.NewReader(p.wal.LocalBackend())
 		writer = backend.NewWriter(p.wal.LocalBackend())
 		cfg    = p.Cfg.Block
 		b      = firstWalBlock
 	)
+
+	ctx, span := tracer.Start(ctx, "Processor.CompleteBlock")
+	defer span.End()
 
 	iter, err := b.Iterator()
 	if err != nil {
@@ -235,12 +365,12 @@ func (p *Processor) completeBlock() error {
 	}
 	defer iter.Close()
 
-	newMeta, err := enc.CreateBlock(ctx, cfg, b.BlockMeta(), iter, reader, writer)
+	newMeta, err := p.enc.CreateBlock(ctx, cfg, b.BlockMeta(), iter, reader, writer)
 	if err != nil {
 		return err
 	}
 
-	newBlock, err := enc.OpenBlock(newMeta, reader)
+	newBlock, err := p.enc.OpenBlock(newMeta, reader)
 	if err != nil {
 		return err
 	}
@@ -249,20 +379,58 @@ func (p *Processor) completeBlock() error {
 	p.blocksMtx.Lock()
 	defer p.blocksMtx.Unlock()
 
-	p.completeBlocks[newMeta.BlockID] = newBlock
+	p.completeBlocks[(uuid.UUID)(newMeta.BlockID)] = ingester.NewLocalBlock(ctx, newBlock, p.wal.LocalBackend())
+	metricCompletedBlocks.WithLabelValues(p.tenant).Inc()
+
+	// Queue for flushing
+	if _, err := p.flushqueue.Enqueue(newFlushOp((uuid.UUID)(newMeta.BlockID))); err != nil {
+		_ = level.Error(p.logger).Log("msg", "local blocks processor failed to enqueue block for flushing", "err", err)
+	}
 
 	err = b.Clear()
 	if err != nil {
 		return err
 	}
-	delete(p.walBlocks, b.BlockMeta().BlockID)
+	delete(p.walBlocks, (uuid.UUID)(b.BlockMeta().BlockID))
 
+	return nil
+}
+
+func (p *Processor) flushBlock(id uuid.UUID) error {
+	p.blocksMtx.RLock()
+	completeBlock := p.completeBlocks[id]
+	p.blocksMtx.RUnlock()
+
+	if completeBlock == nil {
+		return nil
+	}
+
+	ctx := context.Background()
+	err := p.writer.WriteBlock(ctx, completeBlock)
+	if err != nil {
+		return err
+	}
+	metricFlushedBlocks.WithLabelValues(p.tenant).Inc()
+	_ = level.Info(p.logger).Log("msg", "flushed block to storage", "block", id.String())
 	return nil
 }
 
 func (p *Processor) GetMetrics(ctx context.Context, req *tempopb.SpanMetricsRequest) (*tempopb.SpanMetricsResponse, error) {
 	p.blocksMtx.RLock()
 	defer p.blocksMtx.RUnlock()
+
+	var (
+		err       error
+		startNano = uint64(time.Unix(int64(req.Start), 0).UnixNano())
+		endNano   = uint64(time.Unix(int64(req.End), 0).UnixNano())
+	)
+
+	if startNano > 0 && endNano > 0 {
+		cutoff := time.Now().Add(-p.Cfg.CompleteBlockTimeout).Add(-timeBuffer)
+		if startNano < uint64(cutoff.UnixNano()) {
+			return nil, fmt.Errorf("time range must be within last %v", p.Cfg.CompleteBlockTimeout)
+		}
+	}
 
 	// Blocks to check
 	blocks := make([]common.BackendBlock, 0, 1+len(p.walBlocks)+len(p.completeBlocks))
@@ -279,24 +447,40 @@ func (p *Processor) GetMetrics(ctx context.Context, req *tempopb.SpanMetricsRequ
 	m := traceqlmetrics.NewMetricsResults()
 	for _, b := range blocks {
 
-		// Including the trace count in the cache key means we can safely
-		// cache results for a wal block
-		key := fmt.Sprintf("b:%s-c:%d-q:%s-g:%s", b.BlockMeta().BlockID.String(), b.BlockMeta().TotalObjects, req.Query, req.GroupBy)
-		if r := p.metricsCacheGet(key); r != nil {
-			m.Combine(r)
-			continue
+		var (
+			meta       = b.BlockMeta()
+			blockStart = uint32(meta.StartTime.Unix())
+			blockEnd   = uint32(meta.EndTime.Unix())
+			// We can only cache the results of this query on this block
+			// if the time range fully covers this block (not partial).
+			cacheable = req.Start <= blockStart && req.End >= blockEnd
+			// Including the trace count in the cache key means we can safely
+			// cache results for a wal block which can receive new data
+			key = fmt.Sprintf("b:%s-c:%d-q:%s-g:%s", meta.BlockID.String(), meta.TotalObjects, req.Query, req.GroupBy)
+		)
+
+		var r *traceqlmetrics.MetricsResults
+
+		if cacheable {
+			r = p.metricsCacheGet(key)
 		}
 
-		f := traceql.NewSpansetFetcherWrapper(func(ctx context.Context, req traceql.FetchSpansRequest) (traceql.FetchSpansResponse, error) {
-			return b.Fetch(ctx, req, common.DefaultSearchOptions())
-		})
+		// Uncacheable or not found in cache
+		if r == nil {
 
-		r, err := traceqlmetrics.GetMetrics(ctx, req.Query, req.GroupBy, 0, f)
-		if err != nil {
-			return nil, err
+			f := traceql.NewSpansetFetcherWrapper(func(ctx context.Context, req traceql.FetchSpansRequest) (traceql.FetchSpansResponse, error) {
+				return b.Fetch(ctx, req, common.DefaultSearchOptions())
+			})
+
+			r, err = traceqlmetrics.GetMetrics(ctx, req.Query, req.GroupBy, 0, startNano, endNano, f)
+			if err != nil {
+				return nil, err
+			}
+
+			if cacheable {
+				p.metricsCacheSet(key, r)
+			}
 		}
-
-		p.metricsCacheSet(key, r)
 
 		m.Combine(r)
 
@@ -313,10 +497,10 @@ func (p *Processor) GetMetrics(ctx context.Context, req *tempopb.SpanMetricsRequ
 
 	var rawHistorgram *tempopb.RawHistogram
 	var errCount int
-	for static, series := range m.Series {
+	for keys, sh := range m.Series {
 		h := []*tempopb.RawHistogram{}
 
-		for bucket, count := range series.Buckets() {
+		for bucket, count := range sh.Histogram.Buckets() {
 			if count != 0 {
 				rawHistorgram = &tempopb.RawHistogram{
 					Bucket: uint64(bucket),
@@ -328,13 +512,13 @@ func (p *Processor) GetMetrics(ctx context.Context, req *tempopb.SpanMetricsRequ
 		}
 
 		errCount = 0
-		if errs, ok := m.Errors[static]; ok {
+		if errs, ok := m.Errors[keys]; ok {
 			errCount = errs
 		}
 
 		resp.Metrics = append(resp.Metrics, &tempopb.SpanMetrics{
 			LatencyHistogram: h,
-			Static:           toStaticProto(static),
+			Series:           metricSeriesToProto(sh.Series),
 			Errors:           uint64(errCount),
 		})
 	}
@@ -364,10 +548,13 @@ func (p *Processor) deleteOldBlocks() (err error) {
 	p.blocksMtx.Lock()
 	defer p.blocksMtx.Unlock()
 
-	before := time.Now().Add(-p.Cfg.CompleteBlockTimeout)
+	cuttoff := time.Now().Add(-p.Cfg.CompleteBlockTimeout)
 
 	for id, b := range p.walBlocks {
-		if b.BlockMeta().EndTime.Before(before) {
+		if b.BlockMeta().EndTime.Before(cuttoff) {
+			if _, ok := p.completeBlocks[id]; !ok {
+				level.Warn(p.logger).Log("msg", "deleting WAL block that was never completed", "block", id.String())
+			}
 			err = b.Clear()
 			if err != nil {
 				return err
@@ -377,7 +564,25 @@ func (p *Processor) deleteOldBlocks() (err error) {
 	}
 
 	for id, b := range p.completeBlocks {
-		if b.BlockMeta().EndTime.Before(before) {
+		if !p.Cfg.FlushToStorage {
+			if b.BlockMeta().EndTime.Before(cuttoff) {
+				level.Info(p.logger).Log("msg", "deleting complete block", "block", id.String())
+				err = p.wal.LocalBackend().ClearBlock(id, p.tenant)
+				if err != nil {
+					return err
+				}
+				delete(p.completeBlocks, id)
+			}
+			continue
+		}
+
+		flushedTime := b.FlushedTime()
+		if flushedTime.IsZero() {
+			continue
+		}
+
+		if b.BlockMeta().EndTime.Before(cuttoff) {
+			level.Info(p.logger).Log("msg", "deleting flushed complete block", "block", id.String())
 			err = p.wal.LocalBackend().ClearBlock(id, p.tenant)
 			if err != nil {
 				return err
@@ -391,17 +596,15 @@ func (p *Processor) deleteOldBlocks() (err error) {
 
 func (p *Processor) cutIdleTraces(immediate bool) error {
 	p.liveTracesMtx.Lock()
-	defer p.liveTracesMtx.Unlock()
 
 	// Record live traces before flushing so we know the high water mark
-	metricLiveTraces.WithLabelValues(p.tenant).Set(float64(len(p.liveTraces.traces)))
+	metricLiveTraces.WithLabelValues(p.tenant).Set(float64(p.liveTraces.Len()))
+	metricLiveTraceBytes.WithLabelValues(p.tenant).Set(float64(p.liveTraces.Size()))
 
 	since := time.Now().Add(-p.Cfg.TraceIdlePeriod)
-	if immediate {
-		since = time.Time{}
-	}
+	tracesToCut := p.liveTraces.CutIdle(since, immediate)
 
-	tracesToCut := p.liveTraces.CutIdle(since)
+	p.liveTracesMtx.Unlock()
 
 	if len(tracesToCut) == 0 {
 		return nil
@@ -409,16 +612,16 @@ func (p *Processor) cutIdleTraces(immediate bool) error {
 
 	// Sort by ID
 	sort.Slice(tracesToCut, func(i, j int) bool {
-		return bytes.Compare(tracesToCut[i].id, tracesToCut[j].id) == -1
+		return bytes.Compare(tracesToCut[i].ID, tracesToCut[j].ID) == -1
 	})
 
 	for _, t := range tracesToCut {
 
 		tr := &tempopb.Trace{
-			Batches: t.Batches,
+			ResourceSpans: t.Batches,
 		}
 
-		err := p.writeHeadBlock(t.id, tr)
+		err := p.writeHeadBlock(t.ID, tr)
 		if err != nil {
 			return err
 		}
@@ -441,9 +644,26 @@ func (p *Processor) writeHeadBlock(id common.ID, tr *tempopb.Trace) error {
 		}
 	}
 
-	now := uint32(time.Now().Unix())
+	// Get trace timestamp bounds
+	var start, end uint64
+	for _, b := range tr.ResourceSpans {
+		for _, ss := range b.ScopeSpans {
+			for _, s := range ss.Spans {
+				if start == 0 || s.StartTimeUnixNano < start {
+					start = s.StartTimeUnixNano
+				}
+				if s.EndTimeUnixNano > end {
+					end = s.EndTimeUnixNano
+				}
+			}
+		}
+	}
 
-	err := p.headBlock.AppendTrace(id, tr, now, now)
+	// Convert from unix nanos to unix seconds
+	startSeconds := uint32(start / uint64(time.Second))
+	endSeconds := uint32(end / uint64(time.Second))
+
+	err := p.headBlock.AppendTrace(id, tr, startSeconds, endSeconds)
 	if err != nil {
 		return err
 	}
@@ -452,7 +672,13 @@ func (p *Processor) writeHeadBlock(id common.ID, tr *tempopb.Trace) error {
 }
 
 func (p *Processor) resetHeadBlock() error {
-	block, err := p.wal.NewBlock(uuid.New(), p.tenant, model.CurrentEncoding)
+	meta := &backend.BlockMeta{
+		BlockID:           backend.NewUUID(),
+		TenantID:          p.tenant,
+		DedicatedColumns:  p.overrides.DedicatedColumns(p.tenant),
+		ReplicationFactor: backend.MetricsGeneratorReplicationFactor,
+	}
+	block, err := p.wal.NewBlock(meta, model.CurrentEncoding)
 	if err != nil {
 		return err
 	}
@@ -473,13 +699,17 @@ func (p *Processor) cutBlocks(immediate bool) error {
 		return nil
 	}
 
+	// Clear historical trace sizes for traces that weren't seen in this block.
+	p.traceSizes.ClearIdle(p.lastCutTime)
+
 	// Final flush
 	err := p.headBlock.Flush()
 	if err != nil {
 		return fmt.Errorf("failed to flush head block: %w", err)
 	}
 
-	p.walBlocks[p.headBlock.BlockMeta().BlockID] = p.headBlock
+	p.walBlocks[(uuid.UUID)(p.headBlock.BlockMeta().BlockID)] = p.headBlock
+	metricCutBlocks.WithLabelValues(p.tenant).Inc()
 
 	err = p.resetHeadBlock()
 	if err != nil {
@@ -504,12 +734,15 @@ func (p *Processor) reloadBlocks() error {
 	if err != nil {
 		return err
 	}
+	level.Info(p.logger).Log("msg", "reloading wal blocks", "count", len(walBlocks))
 	for _, blk := range walBlocks {
 		meta := blk.BlockMeta()
 		if meta.TenantID == p.tenant {
-			p.walBlocks[blk.BlockMeta().BlockID] = blk
+			level.Info(p.logger).Log("msg", "reloading wal block", "block", meta.BlockID.String())
+			p.walBlocks[(uuid.UUID)(blk.BlockMeta().BlockID)] = blk
 		}
 	}
+	level.Info(p.logger).Log("msg", "reloaded wal blocks", "count", len(p.walBlocks))
 
 	// ------------------------------------
 	// Complete blocks
@@ -522,22 +755,34 @@ func (p *Processor) reloadBlocks() error {
 		return err
 	}
 	if len(tenants) == 0 {
+		level.Info(p.logger).Log("msg", "no tenants found, skipping complete block replay")
 		return nil
 	}
 
-	ids, err := r.Blocks(ctx, p.tenant)
+	ids, _, err := r.Blocks(ctx, p.tenant)
 	if err != nil {
 		return err
 	}
+	level.Info(p.logger).Log("msg", "reloading complete blocks", "count", len(ids))
 
 	for _, id := range ids {
+		level.Info(p.logger).Log("msg", "reloading complete block", "block", id.String())
 		meta, err := r.BlockMeta(ctx, id, t)
 
-		if err == backend.ErrDoesNotExist {
+		var clearBlock bool
+		if err != nil {
+			var vv *json.SyntaxError
+			if errors.Is(err, backend.ErrDoesNotExist) || errors.As(err, &vv) {
+				clearBlock = true
+			}
+		}
+
+		if clearBlock {
+			level.Info(p.logger).Log("msg", "clearing block", "block", id.String(), "err", err)
 			// Partially written block, delete and continue
 			err = l.ClearBlock(id, t)
 			if err != nil {
-				level.Error(log.WithUserID(p.tenant, log.Logger)).Log("msg", "local blocks processor failed to clear partially written block during replay", "err", err)
+				level.Error(p.logger).Log("msg", "local blocks processor failed to clear partially written block during replay", "err", err)
 			}
 			continue
 		}
@@ -550,8 +795,17 @@ func (p *Processor) reloadBlocks() error {
 		if err != nil {
 			return err
 		}
+		level.Info(p.logger).Log("msg", "reloaded complete block", "block", id.String())
 
-		p.completeBlocks[id] = blk
+		lb := ingester.NewLocalBlock(ctx, blk, l)
+		p.completeBlocks[id] = lb
+
+		if p.Cfg.FlushToStorage && lb.FlushedTime().IsZero() {
+			level.Info(p.logger).Log("msg", "queueing reloaded block for flushing", "block", id.String())
+			if _, err := p.flushqueue.Enqueue(newFlushOp(id)); err != nil {
+				_ = level.Error(p.logger).Log("msg", "local blocks processor failed to enqueue block for flushing during replay", "err", err)
+			}
+		}
 	}
 
 	return nil
@@ -570,54 +824,114 @@ func (p *Processor) recordBlockBytes() {
 		sum += b.DataLength()
 	}
 	for _, b := range p.completeBlocks {
-		sum += b.BlockMeta().Size
+		sum += b.BlockMeta().Size_
 	}
 
 	metricBlockSize.WithLabelValues(p.tenant).Set(float64(sum))
 }
 
-// filterBatch to only spans with kind==server. Does not modify the input
+func metricSeriesToProto(series traceqlmetrics.MetricSeries) []*tempopb.KeyValue {
+	var r []*tempopb.KeyValue
+	for _, kv := range series {
+		if kv.Key != "" {
+			r = append(r, traceQLStaticToProto(&kv))
+		}
+	}
+	return r
+}
+
+func traceQLStaticToProto(kv *traceqlmetrics.KeyValue) *tempopb.KeyValue {
+	val := tempopb.TraceQLStatic{Type: int32(kv.Value.Type)}
+
+	switch kv.Value.Type {
+	case traceql.TypeInt:
+		n, _ := kv.Value.Int()
+		val.N = int64(n)
+	case traceql.TypeFloat:
+		val.F = kv.Value.Float()
+	case traceql.TypeString:
+		val.S = kv.Value.EncodeToString(false)
+	case traceql.TypeBoolean:
+		b, _ := kv.Value.Bool()
+		val.B = b
+	case traceql.TypeDuration:
+		d, _ := kv.Value.Duration()
+		val.D = uint64(d)
+	case traceql.TypeStatus:
+		st, _ := kv.Value.Status()
+		val.Status = int32(st)
+	case traceql.TypeKind:
+		k, _ := kv.Value.Kind()
+		val.Kind = int32(k)
+	default:
+		val = tempopb.TraceQLStatic{Type: int32(traceql.TypeNil)}
+	}
+
+	return &tempopb.KeyValue{Key: kv.Key, Value: &val}
+}
+
+// filterBatches to only root spans or kind==server. Does not modify the input
 // but returns a new struct referencing the same input pointers. Returns nil
 // if there were no matching spans.
-func filterBatch(batch *v1.ResourceSpans) *v1.ResourceSpans {
+func filterBatches(batches []*v1.ResourceSpans) []*v1.ResourceSpans {
+	keep := make([]*v1.ResourceSpans, 0, len(batches))
 
-	var keepSS []*v1.ScopeSpans
-	for _, ss := range batch.ScopeSpans {
+	for _, batch := range batches {
+		var keepSS []*v1.ScopeSpans
+		for _, ss := range batch.ScopeSpans {
 
-		var keepSpans []*v1.Span
-		for _, s := range ss.Spans {
-			if s.Kind == v1.Span_SPAN_KIND_SERVER {
-				keepSpans = append(keepSpans, s)
+			var keepSpans []*v1.Span
+			for _, s := range ss.Spans {
+				if s.Kind == v1.Span_SPAN_KIND_SERVER || len(s.ParentSpanId) == 0 {
+					keepSpans = append(keepSpans, s)
+				}
+			}
+
+			if len(keepSpans) > 0 {
+				keepSS = append(keepSS, &v1.ScopeSpans{
+					Scope: ss.Scope,
+					Spans: keepSpans,
+				})
 			}
 		}
 
-		if len(keepSpans) > 0 {
-			keepSS = append(keepSS, &v1.ScopeSpans{
-				Scope: ss.Scope,
-				Spans: keepSpans,
+		if len(keepSS) > 0 {
+			keep = append(keep, &v1.ResourceSpans{
+				Resource:   batch.Resource,
+				ScopeSpans: keepSS,
 			})
 		}
 	}
 
-	if len(keepSS) > 0 {
-		return &v1.ResourceSpans{
-			Resource:   batch.Resource,
-			ScopeSpans: keepSS,
-		}
-	}
-
-	return nil
+	return keep
 }
 
-func toStaticProto(static traceql.Static) *tempopb.TraceQLStatic {
-	return &tempopb.TraceQLStatic{
-		Type:   int32(static.Type),
-		N:      int64(static.N),
-		F:      static.F,
-		S:      static.S,
-		B:      static.B,
-		D:      uint64(static.D),
-		Status: int32(static.Status),
-		Kind:   int32(static.Kind),
+type flushOp struct {
+	blockID  uuid.UUID
+	at       time.Time // When to execute
+	attempts int
+	bo       time.Duration
+}
+
+func newFlushOp(blockID uuid.UUID) *flushOp {
+	return &flushOp{
+		blockID: blockID,
+		at:      time.Now(),
+		bo:      30 * time.Second,
 	}
+}
+
+func (f *flushOp) Key() string { return f.blockID.String() }
+
+func (f *flushOp) Priority() int64 { return -f.at.Unix() }
+
+const maxBackoff = 5 * time.Minute
+
+func (f *flushOp) backoff() time.Duration {
+	f.bo *= 2
+	if f.bo > maxBackoff {
+		f.bo = maxBackoff
+	}
+
+	return f.bo
 }

@@ -112,10 +112,11 @@ func (c *Client) RemoveBucket(ctx context.Context, bucketName string) error {
 
 // AdvancedRemoveOptions intended for internal use by replication
 type AdvancedRemoveOptions struct {
-	ReplicationDeleteMarker bool
-	ReplicationStatus       ReplicationStatus
-	ReplicationMTime        time.Time
-	ReplicationRequest      bool
+	ReplicationDeleteMarker  bool
+	ReplicationStatus        ReplicationStatus
+	ReplicationMTime         time.Time
+	ReplicationRequest       bool
+	ReplicationValidityCheck bool // check permissions
 }
 
 // RemoveObjectOptions represents options specified by user for RemoveObject call
@@ -167,6 +168,9 @@ func (c *Client) removeObject(ctx context.Context, bucketName, objectName string
 	}
 	if opts.Internal.ReplicationRequest {
 		headers.Set(minIOBucketReplicationRequest, "true")
+	}
+	if opts.Internal.ReplicationValidityCheck {
+		headers.Set(minIOBucketReplicationCheck, "true")
 	}
 	if opts.ForceDelete {
 		headers.Set(minIOForceDelete, "true")
@@ -431,7 +435,7 @@ func (c *Client) removeObjects(ctx context.Context, bucketName string, objectsCh
 
 		// Generate remove multi objects XML request
 		removeBytes := generateRemoveMultiObjectsRequest(batch)
-		// Execute GET on bucket to list objects.
+		// Execute POST on bucket to remove objects.
 		resp, err := c.executeMethod(ctx, http.MethodPost, requestMetadata{
 			bucketName:       bucketName,
 			queryValues:      urlValues,

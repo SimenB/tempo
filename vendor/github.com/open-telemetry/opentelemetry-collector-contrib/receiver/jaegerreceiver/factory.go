@@ -1,16 +1,5 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package jaegerreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/jaegerreceiver"
 
@@ -24,54 +13,61 @@ import (
 	"go.opentelemetry.io/collector/config/confighttp"
 	"go.opentelemetry.io/collector/config/confignet"
 	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/featuregate"
 	"go.opentelemetry.io/collector/receiver"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/common/testutil"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/jaegerreceiver/internal/metadata"
 )
 
 const (
-	typeStr   = "jaeger"
-	stability = component.StabilityLevelBeta
-
 	// Protocol values.
 	protoGRPC          = "grpc"
 	protoThriftHTTP    = "thrift_http"
 	protoThriftBinary  = "thrift_binary"
 	protoThriftCompact = "thrift_compact"
 
-	// Default endpoints to bind to.
-	defaultGRPCBindEndpoint          = "0.0.0.0:14250"
-	defaultHTTPBindEndpoint          = "0.0.0.0:14268"
-	defaultThriftCompactBindEndpoint = "0.0.0.0:6831"
-	defaultThriftBinaryBindEndpoint  = "0.0.0.0:6832"
+	// Default ports to bind to.
+	defaultGRPCPort          = 14250
+	defaultHTTPPort          = 14268
+	defaultThriftCompactPort = 6831
+	defaultThriftBinaryPort  = 6832
+)
+
+var disableJaegerReceiverRemoteSampling = featuregate.GlobalRegistry().MustRegister(
+	"receiver.jaeger.DisableRemoteSampling",
+	featuregate.StageBeta,
+	featuregate.WithRegisterDescription("When enabled, the Jaeger Receiver will fail to start when it is configured with remote_sampling config. When disabled, the receiver will start and the remote_sampling config will be no-op."),
 )
 
 // NewFactory creates a new Jaeger receiver factory.
 func NewFactory() receiver.Factory {
 	return receiver.NewFactory(
-		typeStr,
+		metadata.Type,
 		createDefaultConfig,
-		receiver.WithTraces(createTracesReceiver, stability))
+		receiver.WithTraces(createTracesReceiver, metadata.TracesStability))
 }
 
 // CreateDefaultConfig creates the default configuration for Jaeger receiver.
 func createDefaultConfig() component.Config {
 	return &Config{
 		Protocols: Protocols{
-			GRPC: &configgrpc.GRPCServerSettings{
-				NetAddr: confignet.NetAddr{
-					Endpoint:  defaultGRPCBindEndpoint,
-					Transport: "tcp",
+			GRPC: &configgrpc.ServerConfig{
+				NetAddr: confignet.AddrConfig{
+					Endpoint:  testutil.EndpointForPort(defaultGRPCPort),
+					Transport: confignet.TransportTypeTCP,
 				},
 			},
-			ThriftHTTP: &confighttp.HTTPServerSettings{
-				Endpoint: defaultHTTPBindEndpoint,
+			ThriftHTTP: &confighttp.ServerConfig{
+				Endpoint: testutil.EndpointForPort(defaultHTTPPort),
 			},
 			ThriftBinary: &ProtocolUDP{
-				Endpoint:        defaultThriftBinaryBindEndpoint,
-				ServerConfigUDP: DefaultServerConfigUDP(),
+				Endpoint:        testutil.EndpointForPort(defaultThriftBinaryPort),
+				ServerConfigUDP: defaultServerConfigUDP(),
 			},
 			ThriftCompact: &ProtocolUDP{
-				Endpoint:        defaultThriftCompactBindEndpoint,
-				ServerConfigUDP: DefaultServerConfigUDP(),
+				Endpoint:        testutil.EndpointForPort(defaultThriftCompactPort),
+				ServerConfigUDP: defaultServerConfigUDP(),
 			},
 		},
 	}
@@ -80,11 +76,10 @@ func createDefaultConfig() component.Config {
 // createTracesReceiver creates a trace receiver based on provided config.
 func createTracesReceiver(
 	_ context.Context,
-	set receiver.CreateSettings,
+	set receiver.Settings,
 	cfg component.Config,
 	nextConsumer consumer.Traces,
 ) (receiver.Traces, error) {
-
 	// Convert settings in the source config to configuration struct
 	// that Jaeger receiver understands.
 	// Error handling for the conversion is done in the Validate function from the Config object itself.
@@ -94,11 +89,11 @@ func createTracesReceiver(
 	var config configuration
 	// Set ports
 	if rCfg.Protocols.GRPC != nil {
-		config.CollectorGRPCServerSettings = *rCfg.Protocols.GRPC
+		config.GRPCServerConfig = *rCfg.Protocols.GRPC
 	}
 
 	if rCfg.Protocols.ThriftHTTP != nil {
-		config.CollectorHTTPSettings = *rCfg.ThriftHTTP
+		config.HTTPServerConfig = *rCfg.ThriftHTTP
 	}
 
 	if rCfg.Protocols.ThriftBinary != nil {
@@ -107,6 +102,10 @@ func createTracesReceiver(
 
 	if rCfg.Protocols.ThriftCompact != nil {
 		config.AgentCompactThrift = *rCfg.ThriftCompact
+	}
+
+	if rCfg.RemoteSampling != nil {
+		set.Logger.Warn("You are using a deprecated no-op `remote_sampling` option which will be removed soon; use a `jaegerremotesampling` extension instead")
 	}
 
 	// Create the receiver.

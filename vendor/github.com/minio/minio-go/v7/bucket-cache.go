@@ -58,7 +58,7 @@ func (r *bucketLocationCache) Get(bucketName string) (location string, ok bool) 
 }
 
 // Set - Will persist a value into cache.
-func (r *bucketLocationCache) Set(bucketName string, location string) {
+func (r *bucketLocationCache) Set(bucketName, location string) {
 	r.Lock()
 	defer r.Unlock()
 	r.items[bucketName] = location
@@ -212,7 +212,7 @@ func (c *Client) getBucketLocationRequest(ctx context.Context, bucketName string
 	c.setUserAgent(req)
 
 	// Get credentials from the configured credentials provider.
-	value, err := c.credsProvider.Get()
+	value, err := c.credsProvider.GetWithContext(c.CredContext())
 	if err != nil {
 		return nil, err
 	}
@@ -240,9 +240,7 @@ func (c *Client) getBucketLocationRequest(ctx context.Context, bucketName string
 	}
 
 	if signerType.IsV2() {
-		// Get Bucket Location calls should be always path style
-		isVirtualHost := false
-		req = signer.SignV2(*req, accessKeyID, secretAccessKey, isVirtualHost)
+		req = signer.SignV2(*req, accessKeyID, secretAccessKey, isVirtualStyle)
 		return req, nil
 	}
 

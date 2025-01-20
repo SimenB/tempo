@@ -1,6 +1,7 @@
 ---
 title: Tune the consistent hash rings
 menuTitle: Tune the consistent hash rings
+description: Optimize the consistent hash rings for Tempo.
 weight: 40
 ---
 
@@ -35,9 +36,10 @@ This ring is used by the distributors to load balance traffic into the ingesters
 
 **Participants:** Metrics-generators
 
-**Used by:** Distributors
+**Used by:** Distributors, Queriers
 
 This ring is used by distributors to load balance traffic to the metrics-generators. When spans are received, the trace ID is hashed, and the traces are sent to the appropriate metrics-generators based on token ownership in the ring.
+Queriers also use this ring to generate TraceQL metrics from recent traces.
 
 ## Compactor
 

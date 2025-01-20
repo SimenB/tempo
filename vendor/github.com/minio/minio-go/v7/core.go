@@ -62,7 +62,7 @@ func (c Core) CopyObject(ctx context.Context, sourceBucket, sourceObject, destBu
 
 // CopyObjectPart - creates a part in a multipart upload by copying (a
 // part of) an existing object.
-func (c Core) CopyObjectPart(ctx context.Context, srcBucket, srcObject, destBucket, destObject string, uploadID string,
+func (c Core) CopyObjectPart(ctx context.Context, srcBucket, srcObject, destBucket, destObject, uploadID string,
 	partID int, startOffset, length int64, metadata map[string]string,
 ) (p CompletePart, err error) {
 	return c.copyObjectPartDo(ctx, srcBucket, srcObject, destBucket, destObject, uploadID,
@@ -91,6 +91,7 @@ type PutObjectPartOptions struct {
 	Md5Base64, Sha256Hex  string
 	SSE                   encrypt.ServerSide
 	CustomHeader, Trailer http.Header
+	DisableContentSha256  bool
 }
 
 // PutObjectPart - Upload an object part.
@@ -107,7 +108,7 @@ func (c Core) PutObjectPart(ctx context.Context, bucket, object, uploadID string
 		sha256Hex:    opts.Sha256Hex,
 		size:         size,
 		sse:          opts.SSE,
-		streamSha256: true,
+		streamSha256: !opts.DisableContentSha256,
 		customHeader: opts.CustomHeader,
 		trailer:      opts.Trailer,
 	}
@@ -115,7 +116,7 @@ func (c Core) PutObjectPart(ctx context.Context, bucket, object, uploadID string
 }
 
 // ListObjectParts - List uploaded parts of an incomplete upload.x
-func (c Core) ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumberMarker int, maxParts int) (result ListObjectPartsResult, err error) {
+func (c Core) ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumberMarker, maxParts int) (result ListObjectPartsResult, err error) {
 	return c.listObjectPartsQuery(ctx, bucket, object, uploadID, partNumberMarker, maxParts)
 }
 

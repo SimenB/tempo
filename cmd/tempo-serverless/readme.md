@@ -1,5 +1,7 @@
 # tempo-serverless
 
+## NOTE: The Tempo serverless is now deprecated and will be removed in an upcoming release.
+
 This folder is intended to wrap a simple handler for searching backend storage for traces. Subfolders 
 `./cloud-run` and `./lambda` contain specific code necessary to run this handler in the respective
 environments.
@@ -19,7 +21,7 @@ using the `_` character. Note that in the above example `TEMPO_BCS_BUCKET_NAME` 
 
 ### make build-docker
 
-Builds two docker images named `tempo-serverlesss` and `tempo-serverless-lambda` that are used for e2e testing.
+Builds two docker images named `tempo-serverless` and `tempo-serverless-lambda` that are used for e2e testing.
 
 ```
 docker run --rm -p 8080:8080 tempo-serverless

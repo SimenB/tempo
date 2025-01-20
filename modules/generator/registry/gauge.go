@@ -9,9 +9,13 @@ import (
 	"go.uber.org/atomic"
 )
 
-// this is mostly copied from counter
+var _ metric = (*gauge)(nil)
 
+// this is mostly copied from counter
 type gauge struct {
+	//nolint unused
+	metric
+
 	metricName string
 
 	// seriesMtx is used to sync modifications to the map, not to the data in series
@@ -20,22 +24,27 @@ type gauge struct {
 
 	onAddSeries    func(count uint32) bool
 	onRemoveSeries func(count uint32)
+
+	externalLabels map[string]string
 }
 
 type gaugeSeries struct {
-	// labelValueCombo should not be modified after creation
-	labels      LabelPair
+	labels      labels.Labels
 	value       *atomic.Float64
 	lastUpdated *atomic.Int64
 }
 
-var _ Gauge = (*gauge)(nil)
-var _ metric = (*gauge)(nil)
+var (
+	_ Gauge  = (*gauge)(nil)
+	_ metric = (*gauge)(nil)
+)
 
-const add = "add"
-const set = "set"
+const (
+	add = "add"
+	set = "set"
+)
 
-func newGauge(name string, onAddSeries func(uint32) bool, onRemoveSeries func(count uint32)) *gauge {
+func newGauge(name string, onAddSeries func(uint32) bool, onRemoveSeries func(count uint32), externalLabels map[string]string) *gauge {
 	if onAddSeries == nil {
 		onAddSeries = func(uint32) bool {
 			return true
@@ -50,19 +59,23 @@ func newGauge(name string, onAddSeries func(uint32) bool, onRemoveSeries func(co
 		series:         make(map[uint64]*gaugeSeries),
 		onAddSeries:    onAddSeries,
 		onRemoveSeries: onRemoveSeries,
+		externalLabels: externalLabels,
 	}
 }
 
 func (g *gauge) Set(labelValueCombo *LabelValueCombo, value float64) {
-	g.updateSeries(labelValueCombo, value, set)
+	g.updateSeries(labelValueCombo, value, set, true)
 }
 
 func (g *gauge) Inc(labelValueCombo *LabelValueCombo, value float64) {
-	g.updateSeries(labelValueCombo, value, add)
+	g.updateSeries(labelValueCombo, value, add, true)
 }
 
-func (g *gauge) updateSeries(labelValueCombo *LabelValueCombo, value float64, operation string) {
+func (g *gauge) SetForTargetInfo(labelValueCombo *LabelValueCombo, value float64) {
+	g.updateSeries(labelValueCombo, value, set, false)
+}
 
+func (g *gauge) updateSeries(labelValueCombo *LabelValueCombo, value float64, operation string, updateIfAlreadyExist bool) {
 	hash := labelValueCombo.getHash()
 
 	g.seriesMtx.RLock()
@@ -70,6 +83,10 @@ func (g *gauge) updateSeries(labelValueCombo *LabelValueCombo, value float64, op
 	g.seriesMtx.RUnlock()
 
 	if ok {
+		// target_info will always be 1 so if the series exists, we don't need to go through this loop
+		if !updateIfAlreadyExist {
+			return
+		}
 		g.updateSeriesValue(s, value, operation)
 		return
 	}
@@ -92,8 +109,21 @@ func (g *gauge) updateSeries(labelValueCombo *LabelValueCombo, value float64, op
 }
 
 func (g *gauge) newSeries(labelValueCombo *LabelValueCombo, value float64) *gaugeSeries {
+	lbls := labelValueCombo.getLabelPair()
+	lb := labels.NewBuilder(make(labels.Labels, 1+len(lbls.names)+len(g.externalLabels)))
+
+	for i, name := range lbls.names {
+		lb.Set(name, lbls.values[i])
+	}
+
+	for name, value := range g.externalLabels {
+		lb.Set(name, value)
+	}
+
+	lb.Set(labels.MetricName, g.metricName)
+
 	return &gaugeSeries{
-		labels:      labelValueCombo.getLabelPair(),
+		labels:      lb.Labels(),
 		value:       atomic.NewFloat64(value),
 		lastUpdated: atomic.NewInt64(time.Now().UnixMilli()),
 	}
@@ -112,38 +142,19 @@ func (g *gauge) name() string {
 	return g.metricName
 }
 
-func (g *gauge) collectMetrics(appender storage.Appender, timeMs int64, externalLabels map[string]string) (activeSeries int, err error) {
+func (g *gauge) collectMetrics(appender storage.Appender, timeMs int64) (activeSeries int, err error) {
 	g.seriesMtx.RLock()
 	defer g.seriesMtx.RUnlock()
 
 	activeSeries = len(g.series)
 
-	labelsCount := 0
-	if activeSeries > 0 && g.series[0] != nil {
-		labelsCount = len(g.series[0].labels.names)
-	}
-	lbls := make(labels.Labels, 1+len(externalLabels)+labelsCount)
-	lb := labels.NewBuilder(lbls)
-
-	// set metric name
-	lb.Set(labels.MetricName, g.metricName)
-	// set external labels
-	for name, value := range externalLabels {
-		lb.Set(name, value)
-	}
-
 	for _, s := range g.series {
 		t := time.UnixMilli(timeMs)
-		// set series-specific labels
-		for i, name := range s.labels.names {
-			lb.Set(name, s.labels.values[i])
-		}
-		_, err = appender.Append(0, lb.Labels(nil), t.UnixMilli(), s.value.Load())
+		_, err = appender.Append(0, s.labels, t.UnixMilli(), s.value.Load())
 		if err != nil {
 			return
 		}
-
-		// TODO support exemplars
+		// TODO: support exemplars
 	}
 
 	return

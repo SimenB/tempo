@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"fmt"
 	"math/rand"
 	"sync"
 	"testing"
@@ -12,12 +13,12 @@ import (
 
 func Test_counter(t *testing.T) {
 	var seriesAdded int
-	onAdd := func(count uint32) bool {
+	onAdd := func(_ uint32) bool {
 		seriesAdded++
 		return true
 	}
 
-	c := newCounter("my_counter", onAdd, nil)
+	c := newCounter("my_counter", onAdd, nil, nil)
 
 	c.Inc(newLabelValueCombo([]string{"label"}, []string{"value-1"}), 1.0)
 	c.Inc(newLabelValueCombo([]string{"label"}, []string{"value-2"}), 2.0)
@@ -25,14 +26,14 @@ func Test_counter(t *testing.T) {
 	assert.Equal(t, 2, seriesAdded)
 
 	collectionTimeMs := time.Now().UnixMilli()
-	offsetCollectionTimeMs := time.UnixMilli(collectionTimeMs).Add(insertOffsetDuration).UnixMilli()
+	endOfLastMinuteMs := getEndOfLastMinuteMs(collectionTimeMs)
 	expectedSamples := []sample{
-		newSample(map[string]string{"__name__": "my_counter", "label": "value-1"}, collectionTimeMs, 0),
-		newSample(map[string]string{"__name__": "my_counter", "label": "value-1"}, offsetCollectionTimeMs, 1),
-		newSample(map[string]string{"__name__": "my_counter", "label": "value-2"}, collectionTimeMs, 0),
-		newSample(map[string]string{"__name__": "my_counter", "label": "value-2"}, offsetCollectionTimeMs, 2),
+		newSample(map[string]string{"__name__": "my_counter", "label": "value-1"}, endOfLastMinuteMs, 0),
+		newSample(map[string]string{"__name__": "my_counter", "label": "value-1"}, collectionTimeMs, 1),
+		newSample(map[string]string{"__name__": "my_counter", "label": "value-2"}, endOfLastMinuteMs, 0),
+		newSample(map[string]string{"__name__": "my_counter", "label": "value-2"}, collectionTimeMs, 2),
 	}
-	collectMetricAndAssert(t, c, collectionTimeMs, nil, 2, expectedSamples, nil)
+	collectMetricAndAssert(t, c, collectionTimeMs, 2, expectedSamples, nil)
 
 	c.Inc(newLabelValueCombo([]string{"label"}, []string{"value-2"}), 2.0)
 	c.Inc(newLabelValueCombo([]string{"label"}, []string{"value-3"}), 3.0)
@@ -40,13 +41,40 @@ func Test_counter(t *testing.T) {
 	assert.Equal(t, 3, seriesAdded)
 
 	collectionTimeMs = time.Now().UnixMilli()
+	endOfLastMinuteMs = getEndOfLastMinuteMs(collectionTimeMs)
 	expectedSamples = []sample{
 		newSample(map[string]string{"__name__": "my_counter", "label": "value-1"}, collectionTimeMs, 1),
 		newSample(map[string]string{"__name__": "my_counter", "label": "value-2"}, collectionTimeMs, 4),
-		newSample(map[string]string{"__name__": "my_counter", "label": "value-3"}, collectionTimeMs, 0),
-		newSample(map[string]string{"__name__": "my_counter", "label": "value-3"}, offsetCollectionTimeMs, 3),
+		newSample(map[string]string{"__name__": "my_counter", "label": "value-3"}, endOfLastMinuteMs, 0),
+		newSample(map[string]string{"__name__": "my_counter", "label": "value-3"}, collectionTimeMs, 3),
 	}
-	collectMetricAndAssert(t, c, collectionTimeMs, nil, 3, expectedSamples, nil)
+
+	collectMetricAndAssert(t, c, collectionTimeMs, 3, expectedSamples, nil)
+}
+
+func TestCounterDifferentLabels(t *testing.T) {
+	var seriesAdded int
+	onAdd := func(_ uint32) bool {
+		seriesAdded++
+		return true
+	}
+
+	c := newCounter("my_counter", onAdd, nil, nil)
+
+	c.Inc(newLabelValueCombo([]string{"label"}, []string{"value-1"}), 1.0)
+	c.Inc(newLabelValueCombo([]string{"another_label"}, []string{"another_value"}), 2.0)
+
+	assert.Equal(t, 2, seriesAdded)
+
+	collectionTimeMs := time.Now().UnixMilli()
+	endOfLastMinuteMs := getEndOfLastMinuteMs(collectionTimeMs)
+	expectedSamples := []sample{
+		newSample(map[string]string{"__name__": "my_counter", "label": "value-1"}, endOfLastMinuteMs, 0),
+		newSample(map[string]string{"__name__": "my_counter", "label": "value-1"}, collectionTimeMs, 1),
+		newSample(map[string]string{"__name__": "my_counter", "another_label": "another_value"}, endOfLastMinuteMs, 0),
+		newSample(map[string]string{"__name__": "my_counter", "another_label": "another_value"}, collectionTimeMs, 2),
+	}
+	collectMetricAndAssert(t, c, collectionTimeMs, 2, expectedSamples, nil)
 }
 
 func Test_counter_cantAdd(t *testing.T) {
@@ -56,7 +84,7 @@ func Test_counter_cantAdd(t *testing.T) {
 		return canAdd
 	}
 
-	c := newCounter("my_counter", onAdd, nil)
+	c := newCounter("my_counter", onAdd, nil, nil)
 
 	// allow adding new series
 	canAdd = true
@@ -65,14 +93,14 @@ func Test_counter_cantAdd(t *testing.T) {
 	c.Inc(newLabelValueCombo([]string{"label"}, []string{"value-2"}), 2.0)
 
 	collectionTimeMs := time.Now().UnixMilli()
-	offsetCollectionTimeMs := time.UnixMilli(collectionTimeMs).Add(insertOffsetDuration).UnixMilli()
+	endOfLastMinuteMs := getEndOfLastMinuteMs(collectionTimeMs)
 	expectedSamples := []sample{
-		newSample(map[string]string{"__name__": "my_counter", "label": "value-1"}, collectionTimeMs, 0),
-		newSample(map[string]string{"__name__": "my_counter", "label": "value-1"}, offsetCollectionTimeMs, 1),
-		newSample(map[string]string{"__name__": "my_counter", "label": "value-2"}, collectionTimeMs, 0),
-		newSample(map[string]string{"__name__": "my_counter", "label": "value-2"}, offsetCollectionTimeMs, 2),
+		newSample(map[string]string{"__name__": "my_counter", "label": "value-1"}, endOfLastMinuteMs, 0),
+		newSample(map[string]string{"__name__": "my_counter", "label": "value-1"}, collectionTimeMs, 1),
+		newSample(map[string]string{"__name__": "my_counter", "label": "value-2"}, endOfLastMinuteMs, 0),
+		newSample(map[string]string{"__name__": "my_counter", "label": "value-2"}, collectionTimeMs, 2),
 	}
-	collectMetricAndAssert(t, c, collectionTimeMs, nil, 2, expectedSamples, nil)
+	collectMetricAndAssert(t, c, collectionTimeMs, 2, expectedSamples, nil)
 
 	// block new series - existing series can still be updated
 	canAdd = false
@@ -85,7 +113,7 @@ func Test_counter_cantAdd(t *testing.T) {
 		newSample(map[string]string{"__name__": "my_counter", "label": "value-1"}, collectionTimeMs, 1),
 		newSample(map[string]string{"__name__": "my_counter", "label": "value-2"}, collectionTimeMs, 4),
 	}
-	collectMetricAndAssert(t, c, collectionTimeMs, nil, 2, expectedSamples, nil)
+	collectMetricAndAssert(t, c, collectionTimeMs, 2, expectedSamples, nil)
 }
 
 func Test_counter_removeStaleSeries(t *testing.T) {
@@ -95,7 +123,7 @@ func Test_counter_removeStaleSeries(t *testing.T) {
 		removedSeries++
 	}
 
-	c := newCounter("my_counter", nil, onRemove)
+	c := newCounter("my_counter", nil, onRemove, nil)
 
 	timeMs := time.Now().UnixMilli()
 	c.Inc(newLabelValueCombo([]string{"label"}, []string{"value-1"}), 1.0)
@@ -106,14 +134,14 @@ func Test_counter_removeStaleSeries(t *testing.T) {
 	assert.Equal(t, 0, removedSeries)
 
 	collectionTimeMs := time.Now().UnixMilli()
-	offsetCollectionTimeMs := time.UnixMilli(collectionTimeMs).Add(insertOffsetDuration).UnixMilli()
+	endOfLastMinuteMs := getEndOfLastMinuteMs(collectionTimeMs)
 	expectedSamples := []sample{
-		newSample(map[string]string{"__name__": "my_counter", "label": "value-1"}, collectionTimeMs, 0),
-		newSample(map[string]string{"__name__": "my_counter", "label": "value-1"}, offsetCollectionTimeMs, 1),
-		newSample(map[string]string{"__name__": "my_counter", "label": "value-2"}, collectionTimeMs, 0),
-		newSample(map[string]string{"__name__": "my_counter", "label": "value-2"}, offsetCollectionTimeMs, 2),
+		newSample(map[string]string{"__name__": "my_counter", "label": "value-1"}, endOfLastMinuteMs, 0),
+		newSample(map[string]string{"__name__": "my_counter", "label": "value-1"}, collectionTimeMs, 1),
+		newSample(map[string]string{"__name__": "my_counter", "label": "value-2"}, endOfLastMinuteMs, 0),
+		newSample(map[string]string{"__name__": "my_counter", "label": "value-2"}, collectionTimeMs, 2),
 	}
-	collectMetricAndAssert(t, c, collectionTimeMs, nil, 2, expectedSamples, nil)
+	collectMetricAndAssert(t, c, collectionTimeMs, 2, expectedSamples, nil)
 
 	time.Sleep(10 * time.Millisecond)
 	timeMs = time.Now().UnixMilli()
@@ -129,28 +157,28 @@ func Test_counter_removeStaleSeries(t *testing.T) {
 	expectedSamples = []sample{
 		newSample(map[string]string{"__name__": "my_counter", "label": "value-2"}, collectionTimeMs, 4),
 	}
-	collectMetricAndAssert(t, c, collectionTimeMs, nil, 1, expectedSamples, nil)
+	collectMetricAndAssert(t, c, collectionTimeMs, 1, expectedSamples, nil)
 }
 
 func Test_counter_externalLabels(t *testing.T) {
-	c := newCounter("my_counter", nil, nil)
+	c := newCounter("my_counter", nil, nil, map[string]string{"external_label": "external_value"})
 
 	c.Inc(newLabelValueCombo([]string{"label"}, []string{"value-1"}), 1.0)
 	c.Inc(newLabelValueCombo([]string{"label"}, []string{"value-2"}), 2.0)
 
 	collectionTimeMs := time.Now().UnixMilli()
-	offsetCollectionTimeMs := time.UnixMilli(collectionTimeMs).Add(insertOffsetDuration).UnixMilli()
+	endOfLastMinuteMs := getEndOfLastMinuteMs(collectionTimeMs)
 	expectedSamples := []sample{
-		newSample(map[string]string{"__name__": "my_counter", "label": "value-1", "external_label": "external_value"}, collectionTimeMs, 0),
-		newSample(map[string]string{"__name__": "my_counter", "label": "value-1", "external_label": "external_value"}, offsetCollectionTimeMs, 1),
-		newSample(map[string]string{"__name__": "my_counter", "label": "value-2", "external_label": "external_value"}, collectionTimeMs, 0),
-		newSample(map[string]string{"__name__": "my_counter", "label": "value-2", "external_label": "external_value"}, offsetCollectionTimeMs, 2),
+		newSample(map[string]string{"__name__": "my_counter", "label": "value-1", "external_label": "external_value"}, endOfLastMinuteMs, 0),
+		newSample(map[string]string{"__name__": "my_counter", "label": "value-1", "external_label": "external_value"}, collectionTimeMs, 1),
+		newSample(map[string]string{"__name__": "my_counter", "label": "value-2", "external_label": "external_value"}, endOfLastMinuteMs, 0),
+		newSample(map[string]string{"__name__": "my_counter", "label": "value-2", "external_label": "external_value"}, collectionTimeMs, 2),
 	}
-	collectMetricAndAssert(t, c, collectionTimeMs, map[string]string{"external_label": "external_value"}, 2, expectedSamples, nil)
+	collectMetricAndAssert(t, c, collectionTimeMs, 2, expectedSamples, nil)
 }
 
 func Test_counter_concurrencyDataRace(t *testing.T) {
-	c := newCounter("my_counter", nil, nil)
+	c := newCounter("my_counter", nil, nil, nil)
 
 	end := make(chan struct{})
 
@@ -173,7 +201,7 @@ func Test_counter_concurrencyDataRace(t *testing.T) {
 	}
 
 	// this goroutine constantly creates new series
-	var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+	letters := []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 	go accessor(func() {
 		s := make([]rune, 6)
 		for i := range s {
@@ -183,7 +211,7 @@ func Test_counter_concurrencyDataRace(t *testing.T) {
 	})
 
 	go accessor(func() {
-		_, err := c.collectMetrics(&noopAppender{}, 0, nil)
+		_, err := c.collectMetrics(&noopAppender{}, 0)
 		assert.NoError(t, err)
 	})
 
@@ -196,7 +224,7 @@ func Test_counter_concurrencyDataRace(t *testing.T) {
 }
 
 func Test_counter_concurrencyCorrectness(t *testing.T) {
-	c := newCounter("my_counter", nil, nil)
+	c := newCounter("my_counter", nil, nil, nil)
 
 	var wg sync.WaitGroup
 	end := make(chan struct{})
@@ -225,23 +253,31 @@ func Test_counter_concurrencyCorrectness(t *testing.T) {
 	wg.Wait()
 
 	collectionTimeMs := time.Now().UnixMilli()
-	offsetCollectionTimeMs := time.UnixMilli(collectionTimeMs).Add(insertOffsetDuration).UnixMilli()
+	endOfLastMinuteMs := getEndOfLastMinuteMs(collectionTimeMs)
 	expectedSamples := []sample{
-		newSample(map[string]string{"__name__": "my_counter", "label": "value-1"}, collectionTimeMs, 0),
-		newSample(map[string]string{"__name__": "my_counter", "label": "value-1"}, offsetCollectionTimeMs, totalCount.Load()),
+		newSample(map[string]string{"__name__": "my_counter", "label": "value-1"}, endOfLastMinuteMs, 0),
+		newSample(map[string]string{"__name__": "my_counter", "label": "value-1"}, collectionTimeMs, totalCount.Load()),
 	}
-	collectMetricAndAssert(t, c, collectionTimeMs, nil, 1, expectedSamples, nil)
+	collectMetricAndAssert(t, c, collectionTimeMs, 1, expectedSamples, nil)
 }
 
-func collectMetricAndAssert(t *testing.T, m metric, collectionTimeMs int64, externalLabels map[string]string, expectedActiveSeries int, expectedSamples []sample, expectedExemplars []exemplarSample) {
+func collectMetricAndAssert(t *testing.T, m metric, collectionTimeMs int64, expectedActiveSeries int, expectedSamples []sample, expectedExemplars []exemplarSample) {
 	appender := &capturingAppender{}
 
-	activeSeries, err := m.collectMetrics(appender, collectionTimeMs, externalLabels)
+	activeSeries, err := m.collectMetrics(appender, collectionTimeMs)
 	assert.NoError(t, err)
 	assert.Equal(t, expectedActiveSeries, activeSeries)
 
 	assert.False(t, appender.isCommitted)
 	assert.False(t, appender.isRolledback)
 	assert.ElementsMatch(t, expectedSamples, appender.samples)
+	fmt.Println("Expected samples:")
+	for _, expectedSample := range expectedSamples {
+		fmt.Println(" - ", expectedSample.l, expectedSample.v)
+	}
+	fmt.Println("Appender samples:")
+	for _, sample := range appender.samples {
+		fmt.Println(" - ", sample.l, sample.v)
+	}
 	assert.ElementsMatch(t, expectedExemplars, appender.exemplars)
 }

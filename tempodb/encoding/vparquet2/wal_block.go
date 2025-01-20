@@ -3,6 +3,7 @@ package vparquet2
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -14,16 +15,15 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/grafana/dskit/multierror"
+	"github.com/grafana/tempo/pkg/dataquality"
 	"github.com/grafana/tempo/pkg/model"
 	"github.com/grafana/tempo/pkg/model/trace"
 	"github.com/grafana/tempo/pkg/parquetquery"
 	"github.com/grafana/tempo/pkg/tempopb"
 	"github.com/grafana/tempo/pkg/traceql"
-	"github.com/grafana/tempo/pkg/warnings"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding/common"
-	"github.com/pkg/errors"
-	"github.com/segmentio/parquet-go"
+	"github.com/parquet-go/parquet-go"
 )
 
 var _ common.WALBlock = (*walBlock)(nil)
@@ -53,7 +53,7 @@ var walSchema = parquet.SchemaOf(&Trace{})
 // if there are 2 wal files and the second is loaded successfully, but the first fails then b.flushed will contain one entry. then when
 // calling b.openWriter() it will attempt to create a new file as path/folder/00002 which will overwrite the first file. as long as we never
 // append to this file it should be ok.
-func openWALBlock(filename string, path string, ingestionSlack time.Duration, _ time.Duration) (common.WALBlock, error, error) {
+func openWALBlock(filename, path string, ingestionSlack, _ time.Duration) (common.WALBlock, error, error) {
 	dir := filepath.Join(path, filename)
 	_, _, version, err := parseName(filename)
 	if err != nil {
@@ -67,13 +67,13 @@ func openWALBlock(filename string, path string, ingestionSlack time.Duration, _ 
 	metaPath := filepath.Join(dir, backend.MetaName)
 	metaBytes, err := os.ReadFile(metaPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("error reading wal meta json: %s %w", metaPath, err)
+		return nil, nil, fmt.Errorf("error reading wal meta json: %s: %w", metaPath, err)
 	}
 
 	meta := &backend.BlockMeta{}
 	err = json.Unmarshal(metaBytes, meta)
 	if err != nil {
-		return nil, nil, fmt.Errorf("error unmarshaling wal meta json: %s %w", metaPath, err)
+		return nil, nil, fmt.Errorf("error unmarshaling wal meta json: %s: %w", metaPath, err)
 	}
 
 	// below we're going to iterate all of the parquet files in the wal and build the meta, this will correctly
@@ -103,7 +103,7 @@ func openWALBlock(filename string, path string, ingestionSlack time.Duration, _ 
 		// opened but not flushed.
 		i, err := f.Info()
 		if err != nil {
-			return nil, nil, fmt.Errorf("error getting file info: %s %w", f.Name(), err)
+			return nil, nil, fmt.Errorf("error getting file info: %s: %w", f.Name(), err)
 		}
 		if i.Size() == 0 {
 			continue
@@ -112,9 +112,9 @@ func openWALBlock(filename string, path string, ingestionSlack time.Duration, _ 
 		path := filepath.Join(dir, f.Name())
 		page := newWalBlockFlush(path, common.NewIDMap[int64]())
 
-		file, err := page.file()
+		file, err := page.file(context.Background())
 		if err != nil {
-			warning = fmt.Errorf("error opening file info: %s %w", page.path, err)
+			warning = fmt.Errorf("error opening file info: %s: %w", page.path, err)
 			continue
 		}
 
@@ -138,8 +138,8 @@ func openWALBlock(filename string, path string, ingestionSlack time.Duration, _ 
 				switch e.Key {
 				case columnPathTraceID:
 					traceID := e.Value.ByteArray()
-					b.meta.ObjectAdded(traceID, 0, 0)
-					page.ids.Set(traceID, match.RowNumber[0]) // Save rownumber for the trace ID
+					b.meta.ObjectAdded(0, 0)
+					page.ids.Set(traceID, int64(match.RowNumber[0])) // Save rownumber for the trace ID
 				}
 			}
 		}
@@ -152,12 +152,13 @@ func openWALBlock(filename string, path string, ingestionSlack time.Duration, _ 
 }
 
 // createWALBlock creates a new appendable block
-func createWALBlock(id uuid.UUID, tenantID string, filepath string, _ backend.Encoding, dataEncoding string, ingestionSlack time.Duration) (*walBlock, error) {
+func createWALBlock(meta *backend.BlockMeta, filepath, dataEncoding string, ingestionSlack time.Duration) (*walBlock, error) {
 	b := &walBlock{
 		meta: &backend.BlockMeta{
-			Version:  VersionString,
-			BlockID:  id,
-			TenantID: tenantID,
+			Version:           VersionString,
+			BlockID:           meta.BlockID,
+			TenantID:          meta.TenantID,
+			ReplicationFactor: meta.ReplicationFactor,
 		},
 		path:           filepath,
 		ids:            common.NewIDMap[int64](),
@@ -165,7 +166,7 @@ func createWALBlock(id uuid.UUID, tenantID string, filepath string, _ backend.En
 	}
 
 	// build folder
-	err := os.MkdirAll(b.walPath(), os.ModePerm)
+	err := os.MkdirAll(b.walPath(), 0o700)
 	if err != nil {
 		return nil, err
 	}
@@ -208,9 +209,14 @@ func newWalBlockFlush(path string, ids *common.IDMap[int64]) *walBlockFlush {
 }
 
 // file() opens the parquet file and returns it. previously this method cached the file on first open
-// but the memory cost of this was quite high. so instead we open it fresh every time
-func (w *walBlockFlush) file() (*pageFile, error) {
-	file, err := os.OpenFile(w.path, os.O_RDONLY, 0644)
+// but the memory cost of this was quite high. so instead we open it fresh every time.  This
+// also allows it to take the context for the caller.
+func (w *walBlockFlush) file(ctx context.Context) (*pageFile, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	file, err := os.OpenFile(w.path, os.O_RDONLY, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("error opening file: %w", err)
 	}
@@ -220,7 +226,7 @@ func (w *walBlockFlush) file() (*pageFile, error) {
 	}
 	size := info.Size()
 
-	wr := newWalReaderAt(file)
+	wr := newWalReaderAt(ctx, file)
 	pf, err := parquet.OpenFile(wr, size, parquet.SkipBloomFilters(true), parquet.SkipPageIndex(true), parquet.FileSchema(walSchema))
 	if err != nil {
 		return nil, fmt.Errorf("error opening parquet file: %w", err)
@@ -232,7 +238,7 @@ func (w *walBlockFlush) file() (*pageFile, error) {
 }
 
 func (w *walBlockFlush) rowIterator() (*rowIterator, error) {
-	file, err := w.file()
+	file, err := w.file(context.Background())
 	if err != nil {
 		return nil, err
 	}
@@ -322,7 +328,7 @@ func (b *walBlock) Append(id common.ID, buff []byte, start, end uint32) error {
 func (b *walBlock) AppendTrace(id common.ID, trace *tempopb.Trace, start, end uint32) error {
 	b.buffer = traceToParquet(id, trace, b.buffer)
 
-	start, end = b.adjustTimeRangeForSlack(start, end, 0)
+	start, end = b.adjustTimeRangeForSlack(start, end)
 
 	// add to current
 	_, err := b.writer.Write([]*Trace{b.buffer})
@@ -330,7 +336,7 @@ func (b *walBlock) AppendTrace(id common.ID, trace *tempopb.Trace, start, end ui
 		return fmt.Errorf("error writing row: %w", err)
 	}
 
-	b.meta.ObjectAdded(id, start, end)
+	b.meta.ObjectAdded(start, end)
 	b.ids.Set(id, int64(b.ids.Len())) // Next row number
 
 	b.unflushedSize += int64(estimateMarshalledSizeFromTrace(b.buffer))
@@ -338,9 +344,13 @@ func (b *walBlock) AppendTrace(id common.ID, trace *tempopb.Trace, start, end ui
 	return nil
 }
 
-func (b *walBlock) adjustTimeRangeForSlack(start uint32, end uint32, additionalStartSlack time.Duration) (uint32, uint32) {
+func (b *walBlock) Validate(context.Context) error {
+	return common.ErrUnsupported
+}
+
+func (b *walBlock) adjustTimeRangeForSlack(start, end uint32) (uint32, uint32) {
 	now := time.Now()
-	startOfRange := uint32(now.Add(-b.ingestionSlack).Add(-additionalStartSlack).Unix())
+	startOfRange := uint32(now.Add(-b.ingestionSlack).Unix())
 	endOfRange := uint32(now.Add(b.ingestionSlack).Unix())
 
 	warn := false
@@ -348,13 +358,13 @@ func (b *walBlock) adjustTimeRangeForSlack(start uint32, end uint32, additionalS
 		warn = true
 		start = uint32(now.Unix())
 	}
-	if end > endOfRange {
+	if end > endOfRange || end < start {
 		warn = true
 		end = uint32(now.Unix())
 	}
 
 	if warn {
-		warnings.Metric.WithLabelValues(b.meta.TenantID, warnings.ReasonOutsideIngestionSlack).Inc()
+		dataquality.WarnOutsideIngestionSlack(b.meta.TenantID)
 	}
 
 	return start, end
@@ -367,11 +377,10 @@ func (b *walBlock) filepathOf(page int) string {
 }
 
 func (b *walBlock) openWriter() (err error) {
-
 	nextFile := len(b.flushed) + 1
 	filename := b.filepathOf(nextFile)
 
-	b.file, err = os.OpenFile(filename, os.O_CREATE|os.O_WRONLY, 0644)
+	b.file, err = os.OpenFile(filename, os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("error opening file: %w", err)
 	}
@@ -391,7 +400,6 @@ func (b *walBlock) openWriter() (err error) {
 }
 
 func (b *walBlock) Flush() (err error) {
-
 	if b.ids.Len() == 0 {
 		return nil
 	}
@@ -406,7 +414,7 @@ func (b *walBlock) Flush() (err error) {
 	}
 
 	metaPath := filepath.Join(b.walPath(), backend.MetaName)
-	err = os.WriteFile(metaPath, metaBytes, 0600)
+	err = os.WriteFile(metaPath, metaBytes, 0o600)
 	if err != nil {
 		return fmt.Errorf("error writing meta json: %w", err)
 	}
@@ -494,12 +502,12 @@ func (b *walBlock) Clear() error {
 	return errs.Err()
 }
 
-func (b *walBlock) FindTraceByID(ctx context.Context, id common.ID, _ common.SearchOptions) (*tempopb.Trace, error) {
+func (b *walBlock) FindTraceByID(ctx context.Context, id common.ID, opts common.SearchOptions) (*tempopb.Trace, error) {
 	trs := make([]*tempopb.Trace, 0)
 
 	for _, page := range b.flushed {
 		if rowNumber, ok := page.ids.Get(id); ok {
-			file, err := page.file()
+			file, err := page.file(ctx)
 			if err != nil {
 				return nil, fmt.Errorf("error opening file %s: %w", page.path, err)
 			}
@@ -512,37 +520,40 @@ func (b *walBlock) FindTraceByID(ctx context.Context, id common.ID, _ common.Sea
 
 			err = r.SeekToRow(rowNumber)
 			if err != nil {
-				return nil, errors.Wrap(err, "seek to row")
+				return nil, fmt.Errorf("seek to row: %w", err)
 			}
 
 			tr := new(Trace)
 			err = r.Read(tr)
 			if err != nil {
-				return nil, errors.Wrap(err, "error reading row from backend")
+				return nil, fmt.Errorf("error reading row from backend: %w", err)
 			}
 
-			trp := parquetTraceToTempopbTrace(tr)
+			trp := ParquetTraceToTempopbTrace(tr)
 
 			trs = append(trs, trp)
 		}
 	}
 
-	combiner := trace.NewCombiner()
+	combiner := trace.NewCombiner(opts.MaxBytes, false)
 	for i, tr := range trs {
-		combiner.ConsumeWithFinal(tr, i == len(trs)-1)
+		_, err := combiner.ConsumeWithFinal(tr, i == len(trs)-1)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	tr, _ := combiner.Result()
 	return tr, nil
 }
 
-func (b *walBlock) Search(ctx context.Context, req *tempopb.SearchRequest, opts common.SearchOptions) (*tempopb.SearchResponse, error) {
+func (b *walBlock) Search(ctx context.Context, req *tempopb.SearchRequest, _ common.SearchOptions) (*tempopb.SearchResponse, error) {
 	results := &tempopb.SearchResponse{
 		Metrics: &tempopb.SearchMetrics{},
 	}
 
 	for i, blockFlush := range b.readFlushes() {
-		file, err := blockFlush.file()
+		file, err := blockFlush.file(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("error opening file %s: %w", blockFlush.path, err)
 		}
@@ -566,9 +577,9 @@ func (b *walBlock) Search(ctx context.Context, req *tempopb.SearchRequest, opts 
 	return results, nil
 }
 
-func (b *walBlock) SearchTags(ctx context.Context, scope traceql.AttributeScope, cb common.TagCallback, opts common.SearchOptions) error {
+func (b *walBlock) SearchTags(ctx context.Context, scope traceql.AttributeScope, cb common.TagsCallback, mcb common.MetricsCallback, _ common.SearchOptions) error {
 	for i, blockFlush := range b.readFlushes() {
-		file, err := blockFlush.file()
+		file, err := blockFlush.file(ctx)
 		if err != nil {
 			return fmt.Errorf("error opening file %s: %w", blockFlush.path, err)
 		}
@@ -580,12 +591,13 @@ func (b *walBlock) SearchTags(ctx context.Context, scope traceql.AttributeScope,
 		if err != nil {
 			return fmt.Errorf("error searching block [%s %d]: %w", b.meta.BlockID.String(), i, err)
 		}
+		mcb(file.r.BytesRead()) // record bytes read
 	}
 
 	return nil
 }
 
-func (b *walBlock) SearchTagValues(ctx context.Context, tag string, cb common.TagCallback, opts common.SearchOptions) error {
+func (b *walBlock) SearchTagValues(ctx context.Context, tag string, cb common.TagValuesCallback, mcb common.MetricsCallback, opts common.SearchOptions) error {
 	att, ok := translateTagToAttribute[tag]
 	if !ok {
 		att = traceql.NewAttribute(tag)
@@ -597,12 +609,12 @@ func (b *walBlock) SearchTagValues(ctx context.Context, tag string, cb common.Ta
 		return false
 	}
 
-	return b.SearchTagValuesV2(ctx, att, cb2, opts)
+	return b.SearchTagValuesV2(ctx, att, cb2, mcb, opts)
 }
 
-func (b *walBlock) SearchTagValuesV2(ctx context.Context, tag traceql.Attribute, cb common.TagCallbackV2, _ common.SearchOptions) error {
+func (b *walBlock) SearchTagValuesV2(ctx context.Context, tag traceql.Attribute, cb common.TagValuesCallbackV2, mcb common.MetricsCallback, _ common.SearchOptions) error {
 	for i, blockFlush := range b.readFlushes() {
-		file, err := blockFlush.file()
+		file, err := blockFlush.file(ctx)
 		if err != nil {
 			return fmt.Errorf("error opening file %s: %w", blockFlush.path, err)
 		}
@@ -614,6 +626,7 @@ func (b *walBlock) SearchTagValuesV2(ctx context.Context, tag traceql.Attribute,
 		if err != nil {
 			return fmt.Errorf("error searching block [%s %d]: %w", b.meta.BlockID.String(), i, err)
 		}
+		mcb(file.r.BytesRead()) // record bytes read
 	}
 
 	return nil
@@ -623,7 +636,7 @@ func (b *walBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest, opt
 	// todo: this same method is called in backendBlock.Fetch. is there anyway to share this?
 	err := checkConditions(req.Conditions)
 	if err != nil {
-		return traceql.FetchSpansResponse{}, errors.Wrap(err, "conditions invalid")
+		return traceql.FetchSpansResponse{}, fmt.Errorf("conditions invalid: %w", err)
 	}
 
 	blockFlushes := b.readFlushes()
@@ -631,16 +644,16 @@ func (b *walBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest, opt
 	readers := make([]*walReaderAt, 0, len(blockFlushes))
 	iters := make([]traceql.SpansetIterator, 0, len(blockFlushes))
 	for _, page := range blockFlushes {
-		file, err := page.file()
+		file, err := page.file(ctx)
 		if err != nil {
 			return traceql.FetchSpansResponse{}, fmt.Errorf("error opening file %s: %w", page.path, err)
 		}
 
 		pf := file.parquetFile
 
-		iter, err := fetch(ctx, req, pf, opts)
+		iter, err := fetch(ctx, req, pf, pf.RowGroups())
 		if err != nil {
-			return traceql.FetchSpansResponse{}, errors.Wrap(err, "creating fetch iter")
+			return traceql.FetchSpansResponse{}, fmt.Errorf("creating fetch iter: %w", err)
 		}
 
 		wrappedIterator := &pageFileClosingIterator{iter: iter, pageFile: file}
@@ -662,6 +675,14 @@ func (b *walBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest, opt
 			return totalBytesRead
 		},
 	}, nil
+}
+
+func (b *walBlock) FetchTagValues(context.Context, traceql.FetchTagValuesRequest, traceql.FetchTagValuesCallback, common.MetricsCallback, common.SearchOptions) error {
+	return common.ErrUnsupported
+}
+
+func (b *walBlock) FetchTagNames(context.Context, traceql.FetchTagsRequest, traceql.FetchTagsCallback, common.MetricsCallback, common.SearchOptions) error {
+	return common.ErrUnsupported
 }
 
 func (b *walBlock) walPath() string {
@@ -717,7 +738,7 @@ func newRowIterator(r *parquet.Reader, pageFile *pageFile, rowNumbers []common.I
 	}
 }
 
-func (i *rowIterator) peekNextID(ctx context.Context) (common.ID, error) { //nolint:unused //this is being marked as unused, but it's required to satisfy the bookmarkIterator interface
+func (i *rowIterator) peekNextID(context.Context) (common.ID, error) { //nolint:unused //this is being marked as unused, but it's required to satisfy the bookmarkIterator interface
 	if len(i.rowNumbers) == 0 {
 		return nil, nil
 	}
@@ -725,7 +746,7 @@ func (i *rowIterator) peekNextID(ctx context.Context) (common.ID, error) { //nol
 	return i.rowNumbers[0].ID, nil
 }
 
-func (i *rowIterator) Next(ctx context.Context) (common.ID, parquet.Row, error) {
+func (i *rowIterator) Next(context.Context) (common.ID, parquet.Row, error) {
 	if len(i.rowNumbers) == 0 {
 		return nil, nil, nil
 	}
@@ -779,11 +800,11 @@ func newCommonIterator(iter *MultiBlockIterator[parquet.Row], schema *parquet.Sc
 
 func (i *commonIterator) Next(ctx context.Context) (common.ID, *tempopb.Trace, error) {
 	id, row, err := i.iter.Next(ctx)
-	if err != nil && err != io.EOF {
+	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, nil, err
 	}
 
-	if row == nil || err == io.EOF {
+	if row == nil || errors.Is(err, io.EOF) {
 		return nil, nil, nil
 	}
 
@@ -793,7 +814,7 @@ func (i *commonIterator) Next(ctx context.Context) (common.ID, *tempopb.Trace, e
 		return nil, nil, err
 	}
 
-	tr := parquetTraceToTempopbTrace(t)
+	tr := ParquetTraceToTempopbTrace(t)
 	return id, tr, nil
 }
 

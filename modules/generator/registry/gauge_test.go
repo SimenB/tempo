@@ -12,12 +12,12 @@ import (
 
 func Test_gaugeInc(t *testing.T) {
 	var seriesAdded int
-	onAdd := func(count uint32) bool {
+	onAdd := func(_ uint32) bool {
 		seriesAdded++
 		return true
 	}
 
-	c := newGauge("my_gauge", onAdd, nil)
+	c := newGauge("my_gauge", onAdd, nil, nil)
 
 	c.Inc(newLabelValueCombo([]string{"label"}, []string{"value-1"}), 1.0)
 	c.Inc(newLabelValueCombo([]string{"label"}, []string{"value-2"}), 2.0)
@@ -29,7 +29,7 @@ func Test_gaugeInc(t *testing.T) {
 		newSample(map[string]string{"__name__": "my_gauge", "label": "value-1"}, collectionTimeMs, 1),
 		newSample(map[string]string{"__name__": "my_gauge", "label": "value-2"}, collectionTimeMs, 2),
 	}
-	collectMetricAndAssert(t, c, collectionTimeMs, nil, 2, expectedSamples, nil)
+	collectMetricAndAssert(t, c, collectionTimeMs, 2, expectedSamples, nil)
 
 	c.Inc(newLabelValueCombo([]string{"label"}, []string{"value-2"}), 2.0)
 	c.Inc(newLabelValueCombo([]string{"label"}, []string{"value-3"}), 3.0)
@@ -42,17 +42,39 @@ func Test_gaugeInc(t *testing.T) {
 		newSample(map[string]string{"__name__": "my_gauge", "label": "value-2"}, collectionTimeMs, 4),
 		newSample(map[string]string{"__name__": "my_gauge", "label": "value-3"}, collectionTimeMs, 3),
 	}
-	collectMetricAndAssert(t, c, collectionTimeMs, nil, 3, expectedSamples, nil)
+	collectMetricAndAssert(t, c, collectionTimeMs, 3, expectedSamples, nil)
 }
 
-func Test_gaugeSet(t *testing.T) {
+func TestGaugeDifferentLabels(t *testing.T) {
 	var seriesAdded int
-	onAdd := func(count uint32) bool {
+	onAdd := func(_ uint32) bool {
 		seriesAdded++
 		return true
 	}
 
-	c := newGauge("my_gauge", onAdd, nil)
+	c := newGauge("my_gauge", onAdd, nil, nil)
+
+	c.Inc(newLabelValueCombo([]string{"label"}, []string{"value-1"}), 1.0)
+	c.Inc(newLabelValueCombo([]string{"another_label"}, []string{"another_value"}), 2.0)
+
+	assert.Equal(t, 2, seriesAdded)
+
+	collectionTimeMs := time.Now().UnixMilli()
+	expectedSamples := []sample{
+		newSample(map[string]string{"__name__": "my_gauge", "label": "value-1"}, collectionTimeMs, 1),
+		newSample(map[string]string{"__name__": "my_gauge", "another_label": "another_value"}, collectionTimeMs, 2),
+	}
+	collectMetricAndAssert(t, c, collectionTimeMs, 2, expectedSamples, nil)
+}
+
+func Test_gaugeSet(t *testing.T) {
+	var seriesAdded int
+	onAdd := func(_ uint32) bool {
+		seriesAdded++
+		return true
+	}
+
+	c := newGauge("my_gauge", onAdd, nil, nil)
 
 	c.Set(newLabelValueCombo([]string{"label"}, []string{"value-1"}), 1.0)
 	c.Set(newLabelValueCombo([]string{"label"}, []string{"value-2"}), 2.0)
@@ -64,7 +86,7 @@ func Test_gaugeSet(t *testing.T) {
 		newSample(map[string]string{"__name__": "my_gauge", "label": "value-1"}, collectionTimeMs, 1),
 		newSample(map[string]string{"__name__": "my_gauge", "label": "value-2"}, collectionTimeMs, 2),
 	}
-	collectMetricAndAssert(t, c, collectionTimeMs, nil, 2, expectedSamples, nil)
+	collectMetricAndAssert(t, c, collectionTimeMs, 2, expectedSamples, nil)
 
 	c.Set(newLabelValueCombo([]string{"label"}, []string{"value-2"}), 2.0)
 	c.Set(newLabelValueCombo([]string{"label"}, []string{"value-3"}), 3.0)
@@ -77,7 +99,7 @@ func Test_gaugeSet(t *testing.T) {
 		newSample(map[string]string{"__name__": "my_gauge", "label": "value-2"}, collectionTimeMs, 2),
 		newSample(map[string]string{"__name__": "my_gauge", "label": "value-3"}, collectionTimeMs, 3),
 	}
-	collectMetricAndAssert(t, c, collectionTimeMs, nil, 3, expectedSamples, nil)
+	collectMetricAndAssert(t, c, collectionTimeMs, 3, expectedSamples, nil)
 }
 
 func Test_gauge_cantAdd(t *testing.T) {
@@ -87,7 +109,7 @@ func Test_gauge_cantAdd(t *testing.T) {
 		return canAdd
 	}
 
-	c := newGauge("my_gauge", onAdd, nil)
+	c := newGauge("my_gauge", onAdd, nil, nil)
 
 	// allow adding new series
 	canAdd = true
@@ -100,7 +122,7 @@ func Test_gauge_cantAdd(t *testing.T) {
 		newSample(map[string]string{"__name__": "my_gauge", "label": "value-1"}, collectionTimeMs, 1),
 		newSample(map[string]string{"__name__": "my_gauge", "label": "value-2"}, collectionTimeMs, 2),
 	}
-	collectMetricAndAssert(t, c, collectionTimeMs, nil, 2, expectedSamples, nil)
+	collectMetricAndAssert(t, c, collectionTimeMs, 2, expectedSamples, nil)
 
 	// block new series - existing series can still be updated
 	canAdd = false
@@ -113,7 +135,7 @@ func Test_gauge_cantAdd(t *testing.T) {
 		newSample(map[string]string{"__name__": "my_gauge", "label": "value-1"}, collectionTimeMs, 1),
 		newSample(map[string]string{"__name__": "my_gauge", "label": "value-2"}, collectionTimeMs, 4),
 	}
-	collectMetricAndAssert(t, c, collectionTimeMs, nil, 2, expectedSamples, nil)
+	collectMetricAndAssert(t, c, collectionTimeMs, 2, expectedSamples, nil)
 }
 
 func Test_gauge_removeStaleSeries(t *testing.T) {
@@ -123,7 +145,7 @@ func Test_gauge_removeStaleSeries(t *testing.T) {
 		removedSeries++
 	}
 
-	c := newGauge("my_gauge", nil, onRemove)
+	c := newGauge("my_gauge", nil, onRemove, nil)
 
 	timeMs := time.Now().UnixMilli()
 	c.Inc(newLabelValueCombo([]string{"label"}, []string{"value-1"}), 1.0)
@@ -138,7 +160,7 @@ func Test_gauge_removeStaleSeries(t *testing.T) {
 		newSample(map[string]string{"__name__": "my_gauge", "label": "value-1"}, collectionTimeMs, 1),
 		newSample(map[string]string{"__name__": "my_gauge", "label": "value-2"}, collectionTimeMs, 2),
 	}
-	collectMetricAndAssert(t, c, collectionTimeMs, nil, 2, expectedSamples, nil)
+	collectMetricAndAssert(t, c, collectionTimeMs, 2, expectedSamples, nil)
 
 	time.Sleep(10 * time.Millisecond)
 	timeMs = time.Now().UnixMilli()
@@ -154,11 +176,11 @@ func Test_gauge_removeStaleSeries(t *testing.T) {
 	expectedSamples = []sample{
 		newSample(map[string]string{"__name__": "my_gauge", "label": "value-2"}, collectionTimeMs, 4),
 	}
-	collectMetricAndAssert(t, c, collectionTimeMs, nil, 1, expectedSamples, nil)
+	collectMetricAndAssert(t, c, collectionTimeMs, 1, expectedSamples, nil)
 }
 
 func Test_gauge_externalLabels(t *testing.T) {
-	c := newGauge("my_gauge", nil, nil)
+	c := newGauge("my_gauge", nil, nil, map[string]string{"external_label": "external_value"})
 
 	c.Inc(newLabelValueCombo([]string{"label"}, []string{"value-1"}), 1.0)
 	c.Inc(newLabelValueCombo([]string{"label"}, []string{"value-2"}), 2.0)
@@ -168,11 +190,11 @@ func Test_gauge_externalLabels(t *testing.T) {
 		newSample(map[string]string{"__name__": "my_gauge", "label": "value-1", "external_label": "external_value"}, collectionTimeMs, 1),
 		newSample(map[string]string{"__name__": "my_gauge", "label": "value-2", "external_label": "external_value"}, collectionTimeMs, 2),
 	}
-	collectMetricAndAssert(t, c, collectionTimeMs, map[string]string{"external_label": "external_value"}, 2, expectedSamples, nil)
+	collectMetricAndAssert(t, c, collectionTimeMs, 2, expectedSamples, nil)
 }
 
 func Test_gauge_concurrencyDataRace(t *testing.T) {
-	c := newGauge("my_gauge", nil, nil)
+	c := newGauge("my_gauge", nil, nil, nil)
 
 	end := make(chan struct{})
 
@@ -195,7 +217,7 @@ func Test_gauge_concurrencyDataRace(t *testing.T) {
 	}
 
 	// this goroutine constantly creates new series
-	var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+	letters := []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 	go accessor(func() {
 		s := make([]rune, 6)
 		for i := range s {
@@ -205,7 +227,7 @@ func Test_gauge_concurrencyDataRace(t *testing.T) {
 	})
 
 	go accessor(func() {
-		_, err := c.collectMetrics(&noopAppender{}, 0, nil)
+		_, err := c.collectMetrics(&noopAppender{}, 0)
 		assert.NoError(t, err)
 	})
 
@@ -218,7 +240,7 @@ func Test_gauge_concurrencyDataRace(t *testing.T) {
 }
 
 func Test_gauge_concurrencyCorrectness(t *testing.T) {
-	c := newGauge("my_gauge", nil, nil)
+	c := newGauge("my_gauge", nil, nil, nil)
 
 	var wg sync.WaitGroup
 	end := make(chan struct{})
@@ -250,5 +272,5 @@ func Test_gauge_concurrencyCorrectness(t *testing.T) {
 	expectedSamples := []sample{
 		newSample(map[string]string{"__name__": "my_gauge", "label": "value-1"}, collectionTimeMs, float64(totalCount.Load())),
 	}
-	collectMetricAndAssert(t, c, collectionTimeMs, nil, 1, expectedSamples, nil)
+	collectMetricAndAssert(t, c, collectionTimeMs, 1, expectedSamples, nil)
 }

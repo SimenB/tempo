@@ -16,6 +16,8 @@ import (
 	v1_common "github.com/grafana/tempo/pkg/tempopb/common/v1"
 	v1 "github.com/grafana/tempo/pkg/tempopb/trace/v1"
 	"github.com/grafana/tempo/pkg/traceql"
+	"github.com/grafana/tempo/pkg/traceqlmetrics"
+	"github.com/grafana/tempo/pkg/util"
 	"github.com/grafana/tempo/pkg/util/test"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/backend/local"
@@ -61,6 +63,7 @@ func TestBackendBlockSearchTraceQL(t *testing.T) {
 
 	b := makeBackendBlockWithTraces(t, traces)
 	ctx := context.Background()
+	traceIDText := util.TraceIDToHexString(wantTraceID)
 
 	searchesThatMatch := []traceql.FetchSpansRequest{
 		{}, // Empty request
@@ -89,7 +92,10 @@ func TestBackendBlockSearchTraceQL(t *testing.T) {
 		traceql.MustExtractFetchSpansRequestWithMetadata(`{` + LabelDuration + ` <= 100s}`),
 		traceql.MustExtractFetchSpansRequestWithMetadata(`{` + LabelStatus + ` = error}`),
 		traceql.MustExtractFetchSpansRequestWithMetadata(`{` + LabelStatus + ` = 2}`),
+		traceql.MustExtractFetchSpansRequestWithMetadata(`{` + "statusMessage" + ` = "STATUS_CODE_ERROR"}`),
 		traceql.MustExtractFetchSpansRequestWithMetadata(`{` + LabelKind + ` = client }`),
+		traceql.MustExtractFetchSpansRequestWithMetadata(`{ trace:id = "` + traceIDText + `" }`),
+
 		// Resource well-known attributes
 		traceql.MustExtractFetchSpansRequestWithMetadata(`{.` + LabelServiceName + ` = "spanservicename"}`), // Overridden at span
 		traceql.MustExtractFetchSpansRequestWithMetadata(`{.` + LabelCluster + ` = "cluster"}`),
@@ -143,6 +149,10 @@ func TestBackendBlockSearchTraceQL(t *testing.T) {
 		traceql.MustExtractFetchSpansRequestWithMetadata(`{resource.foo = "abc"}`), // Resource-level only
 		traceql.MustExtractFetchSpansRequestWithMetadata(`{span.foo = "def"}`),     // Span-level only
 		traceql.MustExtractFetchSpansRequestWithMetadata(`{.foo}`),                 // Projection only
+
+		// existence
+		traceql.MustExtractFetchSpansRequestWithMetadata(`{.foo != nil}`), // Exist
+
 		makeReq(
 			// Matches either condition
 			parse(t, `{.foo = "baz"}`),
@@ -233,6 +243,7 @@ func TestBackendBlockSearchTraceQL(t *testing.T) {
 		traceql.MustExtractFetchSpansRequestWithMetadata(`{span.bool = true}`),                                    // Bool not match
 		traceql.MustExtractFetchSpansRequestWithMetadata(`{` + LabelDuration + ` >  100s}`),                       // Intrinsic: duration
 		traceql.MustExtractFetchSpansRequestWithMetadata(`{` + LabelStatus + ` = ok}`),                            // Intrinsic: status
+		traceql.MustExtractFetchSpansRequestWithMetadata(`{` + "statusMessage" + ` = "abc"}`),                     // Intrinsic: statusMessage
 		traceql.MustExtractFetchSpansRequestWithMetadata(`{` + LabelName + ` = "nothello"}`),                      // Intrinsic: name
 		traceql.MustExtractFetchSpansRequestWithMetadata(`{` + LabelKind + ` = producer }`),                       // Intrinsic: kind
 		traceql.MustExtractFetchSpansRequestWithMetadata(`{.` + LabelServiceName + ` = "notmyservice"}`),          // Well-known attribute: service.name not match
@@ -338,7 +349,6 @@ func makeReq(conditions ...traceql.Condition) traceql.FetchSpansRequest {
 }
 
 func parse(t *testing.T, q string) traceql.Condition {
-
 	req, err := traceql.ExtractFetchSpansRequest(q)
 	require.NoError(t, err, "query:", q)
 
@@ -510,7 +520,6 @@ func BenchmarkBackendBlockTraceQL(b *testing.B) {
 	require.NoError(b, err)
 
 	for _, tc := range testCases {
-
 		b.Run(tc.name, func(b *testing.B) {
 			b.ResetTimer()
 			bytesRead := 0
@@ -529,6 +538,57 @@ func BenchmarkBackendBlockTraceQL(b *testing.B) {
 			}
 			b.SetBytes(int64(bytesRead) / int64(b.N))
 			b.ReportMetric(float64(bytesRead)/float64(b.N)/1000.0/1000.0, "MB_io/op")
+		})
+	}
+}
+
+// BenchmarkBackendBlockGetMetrics This doesn't really belong here but I can't think of
+// a better place that has access to all of the packages, especially the backend.
+func BenchmarkBackendBlockGetMetrics(b *testing.B) {
+	testCases := []struct {
+		query   string
+		groupby string
+	}{
+		//{"{ resource.service.name = `gme-ingester` }", "resource.cluster"},
+		{"{}", "name"},
+	}
+
+	ctx := context.TODO()
+	tenantID := "1"
+	blockID := uuid.MustParse("2968a567-5873-4e4c-b3cb-21c106c6714b")
+
+	r, _, _, err := local.New(&local.Config{
+		Path: path.Join("/Users/marty/src/tmp/"),
+	})
+	require.NoError(b, err)
+
+	rr := backend.NewReader(r)
+	meta, err := rr.BlockMeta(ctx, blockID, tenantID)
+	require.NoError(b, err)
+	require.Equal(b, VersionString, meta.Version)
+
+	opts := common.DefaultSearchOptions()
+	opts.StartPage = 10
+	opts.TotalPages = 10
+
+	block := newBackendBlock(meta, rr)
+	_, _, err = block.openForSearch(ctx, opts)
+	require.NoError(b, err)
+
+	for _, tc := range testCases {
+		b.Run(tc.query+"/"+tc.groupby, func(b *testing.B) {
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				f := traceql.NewSpansetFetcherWrapper(func(ctx context.Context, req traceql.FetchSpansRequest) (traceql.FetchSpansResponse, error) {
+					return block.Fetch(ctx, req, opts)
+				})
+
+				r, err := traceqlmetrics.GetMetrics(ctx, tc.query, tc.groupby, 0, 0, 0, f)
+
+				require.NoError(b, err)
+				require.NotNil(b, r)
+			}
 		})
 	}
 }

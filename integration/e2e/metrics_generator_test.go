@@ -12,14 +12,13 @@ import (
 	"time"
 
 	"github.com/grafana/e2e"
+	"github.com/grafana/tempo/integration/util"
 	thrift "github.com/jaegertracing/jaeger/thrift-gen/jaeger"
 	io_prometheus_client "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	util "github.com/grafana/tempo/integration"
 )
 
 const (
@@ -131,6 +130,24 @@ func TestMetricsGenerator(t *testing.T) {
 	})
 	require.NoError(t, err)
 
+	// also send one with an invalid label value
+	err = c.EmitBatch(context.Background(), &thrift.Batch{
+		Process: &thrift.Process{ServiceName: "app"},
+		Spans: []*thrift.Span{
+			{
+				TraceIdLow:    traceIDLow,
+				TraceIdHigh:   traceIDHigh,
+				SpanId:        r.Int63(),
+				ParentSpanId:  parentSpanID,
+				OperationName: "\xff\xff",
+				StartTime:     time.Now().UnixMicro(),
+				Duration:      int64(2 * time.Second / time.Microsecond),
+				Tags:          []*thrift.Tag{{Key: "span.kind", VStr: stringPtr("server")}},
+			},
+		},
+	})
+	require.NoError(t, err)
+
 	// Fetch metrics from Prometheus once they are received
 	var metricFamilies map[string]*io_prometheus_client.MetricFamily
 	for {
@@ -192,8 +209,8 @@ func TestMetricsGenerator(t *testing.T) {
 	assert.Equal(t, 1.0, sumValues(metricFamilies, "traces_spanmetrics_latency_sum", lbls))
 
 	// Verify metrics
-	assert.NoError(t, tempoMetricsGenerator.WaitSumMetrics(e2e.Equals(4), "tempo_metrics_generator_spans_received_total"))
-	assert.NoError(t, tempoMetricsGenerator.WaitSumMetrics(e2e.Equals(2), "tempo_metrics_generator_spans_discarded_total"))
+	assert.NoError(t, tempoMetricsGenerator.WaitSumMetrics(e2e.Equals(5), "tempo_metrics_generator_spans_received_total"))
+	assert.NoError(t, tempoMetricsGenerator.WaitSumMetrics(e2e.Equals(3), "tempo_metrics_generator_spans_discarded_total"))
 	assert.NoError(t, tempoMetricsGenerator.WaitSumMetrics(e2e.Equals(25), "tempo_metrics_generator_registry_active_series"))
 	assert.NoError(t, tempoMetricsGenerator.WaitSumMetrics(e2e.Equals(1000), "tempo_metrics_generator_registry_max_active_series"))
 	assert.NoError(t, tempoMetricsGenerator.WaitSumMetrics(e2e.Equals(25), "tempo_metrics_generator_registry_series_added_total"))

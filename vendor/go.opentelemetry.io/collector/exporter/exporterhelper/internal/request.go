@@ -1,47 +1,152 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package internal // import "go.opentelemetry.io/collector/exporter/exporterhelper/internal"
 
-import "context"
+import (
+	"context"
+	"sync/atomic"
+	"time"
 
-// Request defines capabilities required for persistent storage of a request
-type Request interface {
-	// Context returns the context.Context of the requests.
-	Context() context.Context
+	"go.opentelemetry.io/collector/exporter/exporterbatcher"
+	"go.opentelemetry.io/collector/exporter/internal"
+	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/pprofile"
+	"go.opentelemetry.io/collector/pdata/ptrace"
+)
 
-	// SetContext updates the context.Context of the requests.
-	SetContext(context.Context)
-
-	Export(ctx context.Context) error
-
-	// OnError returns a new Request may contain the items left to be sent if some items failed to process and can be retried.
-	// Otherwise, it should return the original Request.
-	OnError(error) Request
-
-	// Count returns the count of spans/metric points or log records.
-	Count() int
-
-	// Marshal serializes the current request into a byte stream
-	Marshal() ([]byte, error)
-
-	// OnProcessingFinished calls the optional callback function to handle cleanup after all processing is finished
-	OnProcessingFinished()
-
-	// SetOnProcessingFinished allows to set an optional callback function to do the cleanup (e.g. remove the item from persistent queue)
-	SetOnProcessingFinished(callback func())
+type fakeRequestSink struct {
+	requestsCount *atomic.Int64
+	itemsCount    *atomic.Int64
 }
 
-// RequestUnmarshaler defines a function which takes a byte slice and unmarshals it into a relevant request
-type RequestUnmarshaler func([]byte) (Request, error)
+func newFakeRequestSink() *fakeRequestSink {
+	return &fakeRequestSink{
+		requestsCount: new(atomic.Int64),
+		itemsCount:    new(atomic.Int64),
+	}
+}
+
+type fakeRequest struct {
+	items     int
+	exportErr error
+	mergeErr  error
+	delay     time.Duration
+	sink      *fakeRequestSink
+}
+
+func (r *fakeRequest) Export(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(r.delay):
+	}
+	if r.exportErr != nil {
+		return r.exportErr
+	}
+	if r.sink != nil {
+		r.sink.requestsCount.Add(1)
+		r.sink.itemsCount.Add(int64(r.items))
+	}
+	return nil
+}
+
+func (r *fakeRequest) ItemsCount() int {
+	return r.items
+}
+
+func (r *fakeRequest) Merge(_ context.Context,
+	r2 internal.Request,
+) (internal.Request, error) {
+	if r == nil {
+		return r2, nil
+	}
+	fr2 := r2.(*fakeRequest)
+	if fr2.mergeErr != nil {
+		return nil, fr2.mergeErr
+	}
+	return &fakeRequest{
+		items:     r.items + fr2.items,
+		sink:      r.sink,
+		exportErr: fr2.exportErr,
+		delay:     r.delay + fr2.delay,
+	}, nil
+}
+
+func (r *fakeRequest) MergeSplit(ctx context.Context, cfg exporterbatcher.MaxSizeConfig,
+	r2 internal.Request,
+) ([]internal.Request, error) {
+	if r.mergeErr != nil {
+		return nil, r.mergeErr
+	}
+
+	maxItems := cfg.MaxSizeItems
+	if maxItems == 0 {
+		r, err := r.Merge(ctx, r2)
+		return []internal.Request{r}, err
+	}
+
+	var fr2 *fakeRequest
+	if r2 == nil {
+		fr2 = &fakeRequest{sink: r.sink, exportErr: r.exportErr, delay: r.delay}
+	} else {
+		if r2.(*fakeRequest).mergeErr != nil {
+			return nil, r2.(*fakeRequest).mergeErr
+		}
+		fr2 = r2.(*fakeRequest)
+		fr2 = &fakeRequest{items: fr2.items, sink: fr2.sink, exportErr: fr2.exportErr, delay: fr2.delay}
+	}
+	var res []internal.Request
+
+	// fill fr1 to maxItems if it's not nil
+
+	r = &fakeRequest{items: r.items, sink: r.sink, exportErr: r.exportErr, delay: r.delay}
+	if fr2.items <= maxItems-r.items {
+		r.items += fr2.items
+		if fr2.exportErr != nil {
+			r.exportErr = fr2.exportErr
+		}
+		return []internal.Request{r}, nil
+	}
+	// if split is needed, we don't propagate exportErr from fr2 to fr1 to test more cases
+	fr2.items -= maxItems - r.items
+	r.items = maxItems
+	res = append(res, r)
+
+	// split fr2 to maxItems
+	for {
+		if fr2.items <= maxItems {
+			res = append(res, &fakeRequest{items: fr2.items, sink: fr2.sink, exportErr: fr2.exportErr, delay: fr2.delay})
+			break
+		}
+		res = append(res, &fakeRequest{items: maxItems, sink: fr2.sink, exportErr: fr2.exportErr, delay: fr2.delay})
+		fr2.items -= maxItems
+	}
+
+	return res, nil
+}
+
+func RequestFromMetricsFunc(reqErr error) func(context.Context, pmetric.Metrics) (internal.Request, error) {
+	return func(_ context.Context, md pmetric.Metrics) (internal.Request, error) {
+		return &fakeRequest{items: md.DataPointCount(), exportErr: reqErr}, nil
+	}
+}
+
+func RequestFromTracesFunc(reqErr error) func(context.Context, ptrace.Traces) (internal.Request, error) {
+	return func(_ context.Context, td ptrace.Traces) (internal.Request, error) {
+		return &fakeRequest{items: td.SpanCount(), exportErr: reqErr}, nil
+	}
+}
+
+func RequestFromLogsFunc(reqErr error) func(context.Context, plog.Logs) (internal.Request, error) {
+	return func(_ context.Context, ld plog.Logs) (internal.Request, error) {
+		return &fakeRequest{items: ld.LogRecordCount(), exportErr: reqErr}, nil
+	}
+}
+
+func RequestFromProfilesFunc(reqErr error) func(context.Context, pprofile.Profiles) (internal.Request, error) {
+	return func(_ context.Context, pd pprofile.Profiles) (internal.Request, error) {
+		return &fakeRequest{items: pd.SampleCount(), exportErr: reqErr}, nil
+	}
+}

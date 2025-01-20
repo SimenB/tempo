@@ -10,12 +10,10 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/google/uuid"
 	"github.com/grafana/dskit/flagext"
+	"github.com/grafana/dskit/user"
 	"github.com/mitchellh/mapstructure"
-	"github.com/pkg/errors"
 	"github.com/spf13/viper"
-	"github.com/weaveworks/common/user"
 	"gopkg.in/yaml.v2"
 
 	"github.com/grafana/tempo/pkg/api"
@@ -72,7 +70,7 @@ func Handler(r *http.Request) (*tempopb.SearchResponse, *HTTPError) {
 		return nil, httpError("extracting org id", err, http.StatusBadRequest)
 	}
 
-	blockID, err := uuid.Parse(searchReq.BlockID)
+	blockID, err := backend.ParseUUID(searchReq.BlockID)
 	if err != nil {
 		return nil, httpError("parsing uuid", err, http.StatusBadRequest)
 	}
@@ -82,17 +80,23 @@ func Handler(r *http.Request) (*tempopb.SearchResponse, *HTTPError) {
 		return nil, httpError("parsing encoding", err, http.StatusBadRequest)
 	}
 
+	dc, err := backend.DedicatedColumnsFromTempopb(searchReq.DedicatedColumns)
+	if err != nil {
+		return nil, httpError("parsing dedicated columns", err, http.StatusBadRequest)
+	}
+
 	// /giphy so meta
 	meta := &backend.BlockMeta{
-		Version:       searchReq.Version,
-		TenantID:      tenant,
-		Encoding:      enc,
-		IndexPageSize: searchReq.IndexPageSize,
-		TotalRecords:  searchReq.TotalRecords,
-		BlockID:       blockID,
-		DataEncoding:  searchReq.DataEncoding,
-		Size:          searchReq.Size_,
-		FooterSize:    searchReq.FooterSize,
+		Version:          searchReq.Version,
+		TenantID:         tenant,
+		Encoding:         enc,
+		IndexPageSize:    searchReq.IndexPageSize,
+		TotalRecords:     searchReq.TotalRecords,
+		BlockID:          blockID,
+		DataEncoding:     searchReq.DataEncoding,
+		Size_:            searchReq.Size_,
+		FooterSize:       searchReq.FooterSize,
+		DedicatedColumns: dc,
 	}
 
 	block, err := encoding.OpenBlock(meta, reader)
@@ -146,13 +150,13 @@ func loadBackend() (backend.Reader, *tempodb.Config, error) {
 		// standard Tempo components to fail during startup. If permissions are not correct this Lambda
 		// will fail instantly anyway and in a heavy query environment the extra calls will start to add up.
 		switch cfg.Backend {
-		case "local":
+		case backend.Local:
 			err = fmt.Errorf("local backend not supported for serverless functions")
-		case "gcs":
+		case backend.GCS:
 			r, _, _, err = gcs.NewNoConfirm(cfg.GCS)
-		case "s3":
+		case backend.S3:
 			r, _, _, err = s3.NewNoConfirm(cfg.S3)
-		case "azure":
+		case backend.Azure:
 			r, _, _, err = azure.NewNoConfirm(cfg.Azure)
 		default:
 			err = fmt.Errorf("unknown backend %s", cfg.Backend)
@@ -185,11 +189,11 @@ func loadConfig() (*tempodb.Config, error) {
 	v := viper.NewWithOptions()
 	b, err := yaml.Marshal(defaultConfig)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to marshal default config")
+		return nil, fmt.Errorf("failed to marshal default config: %w", err)
 	}
 	v.SetConfigType("yaml")
 	if err = v.MergeConfig(bytes.NewReader(b)); err != nil {
-		return nil, errors.Wrap(err, "failed to merge config")
+		return nil, fmt.Errorf("failed to merge config: %w", err)
 	}
 
 	v.AutomaticEnv()
@@ -199,7 +203,7 @@ func loadConfig() (*tempodb.Config, error) {
 	cfg := &tempodb.Config{}
 	err = v.Unmarshal(cfg, setTagName, setDecodeHooks)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to unmarshal config")
+		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
 	}
 
 	return cfg, nil
@@ -226,7 +230,8 @@ func stringToFlagExt() mapstructure.DecodeHookFunc {
 	return func(
 		f reflect.Type,
 		t reflect.Type,
-		data interface{}) (interface{}, error) {
+		data interface{},
+	) (interface{}, error) {
 		if f.Kind() != reflect.String {
 			return data, nil
 		}

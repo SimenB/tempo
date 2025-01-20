@@ -1,22 +1,28 @@
 package util
 
 import (
+	"slices"
+
+	semconv "go.opentelemetry.io/otel/semconv/v1.25.0"
+
 	v1_common "github.com/grafana/tempo/pkg/tempopb/common/v1"
+	v1_resource "github.com/grafana/tempo/pkg/tempopb/resource/v1"
 	v1 "github.com/grafana/tempo/pkg/tempopb/trace/v1"
 	tempo_util "github.com/grafana/tempo/pkg/util"
-	semconv "go.opentelemetry.io/collector/semconv/v1.9.0"
+
+	"github.com/prometheus/prometheus/util/strutil"
 )
 
 func FindServiceName(attributes []*v1_common.KeyValue) (string, bool) {
-	return FindAttributeValue(semconv.AttributeServiceName, attributes)
+	return FindAttributeValue(string(semconv.ServiceNameKey), attributes)
 }
 
 func FindServiceNamespace(attributes []*v1_common.KeyValue) (string, bool) {
-	return FindAttributeValue(semconv.AttributeServiceNamespace, attributes)
+	return FindAttributeValue(string(semconv.ServiceNamespaceKey), attributes)
 }
 
 func FindInstanceID(attributes []*v1_common.KeyValue) (string, bool) {
-	return FindAttributeValue(semconv.AttributeServiceInstanceID, attributes)
+	return FindAttributeValue(string(semconv.ServiceInstanceIDKey), attributes)
 }
 
 func FindAttributeValue(key string, attributes ...[]*v1_common.KeyValue) (string, bool) {
@@ -30,19 +36,26 @@ func FindAttributeValue(key string, attributes ...[]*v1_common.KeyValue) (string
 	return "", false
 }
 
-func GetSpanMultiplier(ratioKey string, span *v1.Span) float64 {
-	spanMultiplier := 1.0
+func GetSpanMultiplier(ratioKey string, span *v1.Span, rs *v1_resource.Resource) float64 {
 	if ratioKey != "" {
 		for _, kv := range span.Attributes {
 			if kv.Key == ratioKey {
 				v := kv.Value.GetDoubleValue()
 				if v > 0 {
-					spanMultiplier = 1.0 / v
+					return 1.0 / v
+				}
+			}
+		}
+		for _, kv := range rs.Attributes {
+			if kv.Key == ratioKey {
+				v := kv.Value.GetDoubleValue()
+				if v > 0 {
+					return 1.0 / v
 				}
 			}
 		}
 	}
-	return spanMultiplier
+	return 1.0
 }
 
 func GetJobValue(attributes []*v1_common.KeyValue) string {
@@ -59,18 +72,37 @@ func GetJobValue(attributes []*v1_common.KeyValue) string {
 	return namespace + svName
 }
 
-func GetTargetInfoAttributesValues(attributes []*v1_common.KeyValue) ([]string, []string) {
-	keys := make([]string, 0)
-	values := make([]string, 0)
+func GetTargetInfoAttributesValues(keys, values *[]string, attributes []*v1_common.KeyValue, exclude, intrinsicLabels []string) {
+	// TODO allocate with known length, or take new params for existing buffers
+	*keys = (*keys)[:0]
+	*values = (*values)[:0]
 	for _, attrs := range attributes {
 		// ignoring job and instance
 		key := attrs.Key
-		value := tempo_util.StringifyAnyValue(attrs.Value)
-		if key != "service.name" && key != "service.namespace" && key != "service.instance.id" {
-			keys = append(keys, key)
-			values = append(values, value)
+		if key != "service.name" && key != "service.namespace" && key != "service.instance.id" && !Contains(key, exclude) {
+			*keys = append(*keys, SanitizeLabelNameWithCollisions(key, intrinsicLabels))
+			value := tempo_util.StringifyAnyValue(attrs.Value)
+			*values = append(*values, value)
 		}
 	}
+}
 
-	return keys, values
+func SanitizeLabelNameWithCollisions(name string, dimensions []string) string {
+	sanitized := strutil.SanitizeLabelName(name)
+
+	// check if same label as intrinsics
+	if slices.Contains(dimensions, sanitized) {
+		return "__" + sanitized
+	}
+
+	return sanitized
+}
+
+func Contains(key string, list []string) bool {
+	for _, exclude := range list {
+		if key == exclude {
+			return true
+		}
+	}
+	return false
 }
